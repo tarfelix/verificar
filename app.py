@@ -339,4 +339,3 @@ else:
     st.error("Conexão com o banco falhou. Verifique as credenciais e o status do banco.")
 
 st.sidebar.info("Verificador de Duplicidade v3.1")
-�
