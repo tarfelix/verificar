@@ -48,11 +48,11 @@ def get_db_engine():
 
     db_uri = f"mysql+mysqlconnector://{db_user}:{db_pass}@{db_host}/{db_name}"
     try:
-        engine = create_engine(db_uri)
+        engine_instance = create_engine(db_uri)
         # Testar conexão
-        with engine.connect() as connection:
+        with engine_instance.connect() as connection:
             pass # Teste de conexão bem-sucedido
-        return engine
+        return engine_instance
     except Exception as e:
         st.error(f"Erro ao conectar ao banco de dados: {e}")
         st.error("Verifique se as credenciais hardcoded estão corretas e se o servidor do banco está acessível.")
@@ -60,8 +60,8 @@ def get_db_engine():
 
 # Função para buscar dados do banco
 @st.cache_data(ttl=600) # Cache dos dados por 10 minutos
-def buscar_atividades(engine, data_inicio, data_fim):
-    if engine is None:
+def buscar_atividades(_engine, data_inicio, data_fim): # <--- CORREÇÃO APLICADA AQUI
+    if _engine is None: # <--- E AQUI
         st.error("Engine do banco de dados não inicializada.")
         return pd.DataFrame()
 
@@ -78,7 +78,7 @@ def buscar_atividades(engine, data_inicio, data_fim):
         ORDER BY activity_folder, activity_date, activity_id
     """)
     try:
-        with engine.connect() as connection:
+        with _engine.connect() as connection: # <--- E AQUI
             df = pd.read_sql(query, connection, params={
                 "tipo_atividade": "Verificar",
                 "status_atividade": "Aberta",
@@ -98,7 +98,6 @@ def buscar_atividades(engine, data_inicio, data_fim):
 
 st.title("🔎 Verificador de Duplicidade de Atividades")
 st.markdown("Este aplicativo ajuda a identificar atividades do tipo 'Verificar' que podem ser duplicadas, com base na pasta e similaridade do texto da publicação.")
-st.warning("⚠️ As credenciais do banco de dados estão diretamente no código. Esta abordagem não é segura para ambientes de produção ou código compartilhado.")
 
 
 # Conectar ao banco
@@ -129,7 +128,9 @@ if engine:
         st.stop() # Impede a execução do restante do script se as datas forem inválidas
 
     # --- Carregar Dados ---
+    # A função buscar_atividades agora espera _engine como primeiro argumento
     df_atividades = buscar_atividades(engine, data_inicio_filtro, data_fim_filtro)
+
 
     if df_atividades.empty:
         st.info(f"Nenhuma atividade 'Verificar' (Aberta) encontrada para o período de {data_inicio_filtro.strftime('%d/%m/%Y')} a {data_fim_filtro.strftime('%d/%m/%Y')}.")
