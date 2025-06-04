@@ -3,11 +3,12 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
 import difflib
+import io # Para exportação XLSX
 
 # ==============================================================================
 # CONFIGURAÇÕES E FUNÇÕES AUXILIARES
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade Avançado")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade Melhorado")
 
 def calcular_similaridade(texto_a, texto_b):
     if texto_a is None or texto_b is None: return 0.0
@@ -35,7 +36,7 @@ def get_db_engine():
         return None
 
 @st.cache_data(ttl=300)
-def buscar_atividades_completas(_engine, data_inicio, data_fim):
+def buscar_atividades_raw(_engine, data_inicio, data_fim): # Renomeado para clareza
     if _engine is None: return pd.DataFrame()
     query = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, 
@@ -65,43 +66,22 @@ def gerar_links_zflow(activity_id):
     return {"antigo": link_antigo, "novo": link_novo}
 
 # ==============================================================================
-# Inicialização e Gerenciamento do Estado da Sessão para Dialogs
+# Estado da Sessão para Comparação
 # ==============================================================================
-if 'show_texto_dialog' not in st.session_state:
-    st.session_state.show_texto_dialog = False
-if 'atividade_para_texto_dialog' not in st.session_state:
-    st.session_state.atividade_para_texto_dialog = None
+if 'comparacao_ativa' not in st.session_state:
+    st.session_state.comparacao_ativa = None # Guarda {'id_base': ..., 'id_comparar': ...}
+if 'atividade_base_comparacao' not in st.session_state:
+    st.session_state.atividade_base_comparacao = None
+if 'atividade_comparar_comparacao' not in st.session_state:
+    st.session_state.atividade_comparar_comparacao = None
 
-if 'show_comparacao_dialog' not in st.session_state:
-    st.session_state.show_comparacao_dialog = False
-if 'atividades_para_comparacao_dialog' not in st.session_state:
-    st.session_state.atividades_para_comparacao_dialog = None
-
-# ==============================================================================
-# Funções para abrir e fechar dialogs
-# ==============================================================================
-def abrir_dialog_texto(atividade):
-    st.session_state.atividade_para_texto_dialog = atividade
-    st.session_state.show_texto_dialog = True
-
-def fechar_dialog_texto():
-    st.session_state.show_texto_dialog = False
-    st.session_state.atividade_para_texto_dialog = None
-
-def abrir_dialog_comparacao(atividade_base, atividade_comparar):
-    st.session_state.atividades_para_comparacao_dialog = {'base': atividade_base, 'comparar': atividade_comparar}
-    st.session_state.show_comparacao_dialog = True
-
-def fechar_dialog_comparacao():
-    st.session_state.show_comparacao_dialog = False
-    st.session_state.atividades_para_comparacao_dialog = None
 
 # ==============================================================================
 # INTERFACE DO USUÁRIO (Streamlit)
 # ==============================================================================
-st.title("🔎 Verificador de Duplicidade Avançado")
+st.title("🔎 Verificador de Duplicidade Melhorado")
 st.markdown("Análise de atividades 'Verificar' para identificar potenciais duplicidades.")
-st.warning("⚠️ Credenciais do banco no código. Não seguro para produção.")
+# Aviso de credenciais removido conforme solicitado
 
 engine = get_db_engine()
 
@@ -110,188 +90,245 @@ if engine:
     st.sidebar.header("⚙️ Filtros e Opções")
     hoje = datetime.today().date()
     
-    periodo_selecionado = st.sidebar.radio("Período das atividades:", ("Hoje, Ontem e Amanhã", "Intervalo Personalizado"), key="periodo_radio_v3")
+    periodo_selecionado = st.sidebar.radio("Período das atividades:", ("Hoje, Ontem e Amanhã", "Intervalo Personalizado"), key="periodo_radio_v4")
     data_inicio_filtro, data_fim_filtro = (hoje - timedelta(days=1), hoje + timedelta(days=1)) if periodo_selecionado == "Hoje, Ontem e Amanhã" else \
-                                          (st.sidebar.date_input("Data Início", hoje - timedelta(days=1), key="data_inicio_v3"), st.sidebar.date_input("Data Fim", hoje + timedelta(days=1), key="data_fim_v3"))
+                                          (st.sidebar.date_input("Data Início", hoje - timedelta(days=1), key="data_inicio_v4"), st.sidebar.date_input("Data Fim", hoje + timedelta(days=1), key="data_fim_v4"))
 
     if data_inicio_filtro > data_fim_filtro:
         st.sidebar.error("Data de início posterior à data de fim.")
         st.stop()
 
-    df_atividades_raw = buscar_atividades_completas(engine, data_inicio_filtro, data_fim_filtro)
+    df_atividades_inicial = buscar_atividades_raw(engine, data_inicio_filtro, data_fim_filtro)
 
-    if df_atividades_raw.empty:
+    if df_atividades_inicial.empty:
         st.info(f"Nenhuma atividade 'Verificar' no período de {data_inicio_filtro.strftime('%d/%m/%Y')} a {data_fim_filtro.strftime('%d/%m/%Y')}.")
     else:
-        st.success(f"{len(df_atividades_raw)} atividades 'Verificar' carregadas.")
+        st.success(f"{len(df_atividades_inicial)} atividades 'Verificar' (todos os status) carregadas para o período inicial.")
 
-        usuarios_disponiveis = sorted(df_atividades_raw['user_profile_name'].dropna().unique())
-        usuarios_selecionados_exibicao = st.sidebar.multiselect("Filtrar exibição por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_v3")
+        # --- Filtros Adicionais na Sidebar ---
+        pastas_disponiveis = sorted(df_atividades_inicial['activity_folder'].dropna().unique())
+        pastas_selecionadas = st.sidebar.multiselect("Filtrar por Pasta(s):", pastas_disponiveis, default=[], key="pasta_filter_v4")
+
+        status_disponiveis = sorted(df_atividades_inicial['activity_status'].dropna().unique())
+        status_selecionados = st.sidebar.multiselect("Filtrar por Status:", status_disponiveis, default=[], key="status_filter_v4")
         
-        min_similaridade_display = st.sidebar.slider("Similaridade de texto mínima (%):", 0, 100, 50, 5, key="sim_slider_v3") / 100.0
+        usuarios_disponiveis = sorted(df_atividades_inicial['user_profile_name'].dropna().unique())
+        usuarios_selecionados_exibicao = st.sidebar.multiselect("Filtrar exibição por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_v4")
         
-        apenas_potenciais_duplicatas_cb = st.sidebar.checkbox("Mostrar apenas com potenciais duplicatas", False, key="dup_cb_v3")
-        apenas_usuarios_diferentes_cb = st.sidebar.checkbox("Mostrar apenas pastas com múltiplos usuários", False, key="multiuser_cb_v3")
+        min_similaridade_display = st.sidebar.slider("Similaridade de texto mínima (%):", 0, 100, 50, 5, key="sim_slider_v4") / 100.0
+        
+        apenas_potenciais_duplicatas_cb = st.sidebar.checkbox("Mostrar apenas com potenciais duplicatas", False, key="dup_cb_v4")
+        apenas_usuarios_diferentes_cb = st.sidebar.checkbox("Mostrar apenas pastas com múltiplos usuários (na análise)", False, key="multiuser_cb_v4")
 
         ordem_pastas = st.sidebar.selectbox(
             "Ordenar pastas por:",
             ("Nome da Pasta (A-Z)", "Mais Atividades Primeiro", "Mais Potenciais Duplicatas Primeiro (beta)"),
-            key="ordem_pastas_v3"
+            key="ordem_pastas_v4"
         )
         st.sidebar.markdown("---")
-        if st.sidebar.button("Exportar Potenciais Duplicatas para CSV", key="export_btn_v3"):
-            st.sidebar.info("Funcionalidade de exportação em desenvolvimento.")
-
-        # --- Pré-processamento e Análise de Duplicidade ---
-        similaridades_globais = {}
-        atividades_com_duplicatas_ids = set()
-        pastas_com_multiplos_usuarios_set = set()
-
-        for nome_pasta, df_pasta_analise in df_atividades_raw.groupby('activity_folder'):
-            if df_pasta_analise['user_profile_name'].nunique() > 1:
-                pastas_com_multiplos_usuarios_set.add(nome_pasta)
-
-            atividades_lista = df_pasta_analise.to_dict('records')
-            for i in range(len(atividades_lista)):
-                base = atividades_lista[i]
-                if base['activity_id'] not in similaridades_globais: similaridades_globais[base['activity_id']] = []
-                
-                for j in range(i + 1, len(atividades_lista)):
-                    comparar = atividades_lista[j]
-                    sim = calcular_similaridade(base['Texto'], comparar['Texto'])
-                    if sim >= min_similaridade_display:
-                        atividades_com_duplicatas_ids.add(base['activity_id'])
-                        atividades_com_duplicatas_ids.add(comparar['activity_id'])
-                        
-                        cor = obter_cor_similaridade(sim)
-                        similaridades_globais[base['activity_id']].append({
-                            'id_similar': comparar['activity_id'], 'ratio': sim, 'cor': cor, 
-                            'data_similar': comparar['activity_date'], 'usuario_similar': comparar['user_profile_name'],
-                            'status_similar': comparar['activity_status']
-                        })
-                        if comparar['activity_id'] not in similaridades_globais: similaridades_globais[comparar['activity_id']] = []
-                        similaridades_globais[comparar['activity_id']].append({
-                            'id_similar': base['activity_id'], 'ratio': sim, 'cor': cor,
-                            'data_similar': base['activity_date'], 'usuario_similar': base['user_profile_name'],
-                            'status_similar': base['activity_status']
-                        })
         
-        for key in similaridades_globais:
-            similaridades_globais[key] = sorted(similaridades_globais[key], key=lambda x: x['ratio'], reverse=True)
+        # Aplicar filtros de pasta e status ANTES da análise de duplicidade
+        df_analise = df_atividades_inicial.copy()
+        if pastas_selecionadas:
+            df_analise = df_analise[df_analise['activity_folder'].isin(pastas_selecionadas)]
+        if status_selecionados:
+            df_analise = df_analise[df_analise['activity_status'].isin(status_selecionados)]
 
-        # --- Filtragem para Exibição ---
-        df_exibir = df_atividades_raw.copy()
-        if usuarios_selecionados_exibicao:
-            df_exibir = df_exibir[df_exibir['user_profile_name'].isin(usuarios_selecionados_exibicao)]
+        # --- Pré-processamento e Análise de Duplicidade (sobre df_analise) ---
+        similaridades_globais = {} 
+        atividades_com_duplicatas_ids = set()
+        pastas_com_multiplos_usuarios_set_analise = set() # Baseado no df_analise
+
+        if not df_analise.empty:
+            for nome_pasta_analise, df_pasta_para_analise in df_analise.groupby('activity_folder'):
+                if df_pasta_para_analise['user_profile_name'].nunique() > 1:
+                    pastas_com_multiplos_usuarios_set_analise.add(nome_pasta_analise)
+
+                atividades_lista_analise = df_pasta_para_analise.to_dict('records')
+                for i in range(len(atividades_lista_analise)):
+                    base = atividades_lista_analise[i]
+                    if base['activity_id'] not in similaridades_globais: similaridades_globais[base['activity_id']] = []
+                    
+                    for j in range(i + 1, len(atividades_lista_analise)):
+                        comparar = atividades_lista_analise[j]
+                        sim = calcular_similaridade(base['Texto'], comparar['Texto'])
+                        if sim >= min_similaridade_display:
+                            atividades_com_duplicatas_ids.add(base['activity_id'])
+                            atividades_com_duplicatas_ids.add(comparar['activity_id'])
+                            
+                            cor = obter_cor_similaridade(sim)
+                            similaridades_globais[base['activity_id']].append({
+                                'id_similar': comparar['activity_id'], 'ratio': sim, 'cor': cor, 
+                                'data_similar': comparar['activity_date'], 'usuario_similar': comparar['user_profile_name'],
+                                'status_similar': comparar['activity_status']
+                            })
+                            if comparar['activity_id'] not in similaridades_globais: similaridades_globais[comparar['activity_id']] = []
+                            similaridades_globais[comparar['activity_id']].append({
+                                'id_similar': base['activity_id'], 'ratio': sim, 'cor': cor,
+                                'data_similar': base['activity_date'], 'usuario_similar': base['user_profile_name'],
+                                'status_similar': base['activity_status']
+                            })
+            
+            for key_sim in similaridades_globais: # Renomeado para evitar conflito
+                similaridades_globais[key_sim] = sorted(similaridades_globais[key_sim], key=lambda x: x['ratio'], reverse=True)
+
+        # --- Filtragem para Exibição (sobre df_analise) ---
+        df_exibir_final = df_analise.copy() # Começa com o df já filtrado por pasta e status
+        if usuarios_selecionados_exibicao: # Filtro de usuário é apenas para exibição
+            df_exibir_final = df_exibir_final[df_exibir_final['user_profile_name'].isin(usuarios_selecionados_exibicao)]
         if apenas_potenciais_duplicatas_cb:
-            df_exibir = df_exibir[df_exibir['activity_id'].isin(atividades_com_duplicatas_ids)]
-        if apenas_usuarios_diferentes_cb:
-            df_exibir = df_exibir[df_exibir['activity_folder'].isin(pastas_com_multiplos_usuarios_set)]
+            df_exibir_final = df_exibir_final[df_exibir_final['activity_id'].isin(atividades_com_duplicatas_ids)]
+        if apenas_usuarios_diferentes_cb: # Este filtro agora se baseia nas pastas identificadas em df_analise
+            df_exibir_final = df_exibir_final[df_exibir_final['activity_folder'].isin(pastas_com_multiplos_usuarios_set_analise)]
 
-        # --- Lógica de Ordenação das Pastas ---
-        lista_pastas_para_exibir = []
-        if not df_exibir.empty:
-            pastas_agrupadas_exibicao = df_exibir.groupby('activity_folder')
+
+        # --- Botão de Exportação ---
+        if st.sidebar.button("Exportar Dados Exibidos para XLSX", key="export_xlsx_btn_v4"):
+            if not df_exibir_final.empty:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_exibir_final.to_excel(writer, index=False, sheet_name='Atividades_Filtradas')
+                    
+                    # Criar uma aba para duplicatas detalhadas (opcional, mas útil)
+                    duplicatas_export_list = []
+                    for act_id_export, dups in similaridades_globais.items():
+                        if act_id_export in df_exibir_final['activity_id'].values: # Apenas para atividades exibidas
+                            for dup_info_export in dups:
+                                duplicatas_export_list.append({
+                                    'ID_Base': act_id_export,
+                                    'ID_Duplicata_Potencial': dup_info_export['id_similar'],
+                                    'Percentual_Similaridade': dup_info_export['ratio'],
+                                    'Data_Duplicata': dup_info_export['data_similar'],
+                                    'Usuario_Duplicata': dup_info_export['usuario_similar'],
+                                    'Status_Duplicata': dup_info_export['status_similar']
+                                })
+                    if duplicatas_export_list:
+                        df_duplicatas_export = pd.DataFrame(duplicatas_export_list)
+                        df_duplicatas_export.to_excel(writer, index=False, sheet_name='Potenciais_Duplicatas')
+
+                st.sidebar.download_button(
+                    label="Baixar XLSX",
+                    data=output.getvalue(),
+                    file_name=f"atividades_verificar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.sidebar.warning("Nenhum dado para exportar com os filtros atuais.")
+
+
+        # --- Lógica de Ordenação das Pastas (sobre df_exibir_final) ---
+        lista_pastas_para_renderizar = [] # Renomeado para evitar conflito
+        if not df_exibir_final.empty:
+            pastas_agrupadas_renderizar = df_exibir_final.groupby('activity_folder') # Renomeado
+            
             if ordem_pastas == "Nome da Pasta (A-Z)":
-                lista_pastas_para_exibir = sorted(pastas_agrupadas_exibicao.groups.keys())
+                lista_pastas_para_renderizar = sorted(pastas_agrupadas_renderizar.groups.keys())
             elif ordem_pastas == "Mais Atividades Primeiro":
-                lista_pastas_para_exibir = pastas_agrupadas_exibicao.size().sort_values(ascending=False).index.tolist()
+                lista_pastas_para_renderizar = pastas_agrupadas_renderizar.size().sort_values(ascending=False).index.tolist()
             elif ordem_pastas == "Mais Potenciais Duplicatas Primeiro (beta)":
-                contagem_duplicatas_pasta = {}
-                for nome_pasta, df_p in pastas_agrupadas_exibicao:
-                    count = 0
-                    for act_id_p in df_p['activity_id']: # Renomeado para evitar conflito
-                        if act_id_p in similaridades_globais and similaridades_globais[act_id_p]:
-                            count +=1 
+                contagem_duplicatas_pasta_render = {} # Renomeado
+                for nome_pasta_render, df_p_render in pastas_agrupadas_renderizar: # Renomeado
+                    count_render = 0 # Renomeado
+                    for act_id_render in df_p_render['activity_id']: # Renomeado
+                        if act_id_render in similaridades_globais and similaridades_globais[act_id_render]:
+                            count_render +=1 
                             break 
-                    if count > 0: contagem_duplicatas_pasta[nome_pasta] = df_p[df_p['activity_id'].isin(atividades_com_duplicatas_ids)].shape[0]
-                lista_pastas_para_exibir = sorted(contagem_duplicatas_pasta, key=contagem_duplicatas_pasta.get, reverse=True)
-                pastas_sem_duplicatas = [p for p in pastas_agrupadas_exibicao.groups.keys() if p not in lista_pastas_para_exibir]
-                lista_pastas_para_exibir.extend(sorted(pastas_sem_duplicatas))
+                    if count_render > 0: contagem_duplicatas_pasta_render[nome_pasta_render] = df_p_render[df_p_render['activity_id'].isin(atividades_com_duplicatas_ids)].shape[0]
+                lista_pastas_para_renderizar = sorted(contagem_duplicatas_pasta_render, key=contagem_duplicatas_pasta_render.get, reverse=True)
+                pastas_sem_duplicatas_render = [p_render for p_render in pastas_agrupadas_renderizar.groups.keys() if p_render not in lista_pastas_para_renderizar] # Renomeado
+                lista_pastas_para_renderizar.extend(sorted(pastas_sem_duplicatas_render))
 
         # --- Exibição Principal ---
-        if not lista_pastas_para_exibir and not df_exibir.empty:
+        st.header("Resultados da Análise")
+        if not lista_pastas_para_renderizar and not df_exibir_final.empty:
             st.info("Nenhuma pasta corresponde a todos os critérios de filtro de exibição selecionados.")
-        elif df_exibir.empty :
-             st.info("Nenhuma atividade 'Verificar' corresponde aos filtros de data e exibição selecionados.")
+        elif df_exibir_final.empty :
+             st.info("Nenhuma atividade 'Verificar' corresponde aos filtros aplicados.")
 
-        for nome_pasta in lista_pastas_para_exibir:
-            df_pasta_exibicao_atual = df_exibir[df_exibir['activity_folder'] == nome_pasta]
-            multi_user_info = " (Múltiplos Usuários na Análise)" if nome_pasta in pastas_com_multiplos_usuarios_set else ""
+        for nome_pasta_render_loop in lista_pastas_para_renderizar: # Renomeado
+            df_pasta_render_loop = df_exibir_final[df_exibir_final['activity_folder'] == nome_pasta_render_loop] # Renomeado
+            multi_user_info_display = " (Múltiplos Usuários na Análise)" if nome_pasta_render_loop in pastas_com_multiplos_usuarios_set_analise else "" # Renomeado
             
-            with st.expander(f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao_atual)} atividades nesta exibição){multi_user_info}", expanded=True):
-                if nome_pasta in pastas_com_multiplos_usuarios_set:
-                     nomes_originais = df_atividades_raw[df_atividades_raw['activity_folder'] == nome_pasta]['user_profile_name'].unique()
-                     st.caption(f"👥 Usuários na análise completa desta pasta: {', '.join(nomes_originais)}")
+            with st.expander(f"📁 Pasta: {nome_pasta_render_loop} ({len(df_pasta_render_loop)} atividades nesta exibição){multi_user_info_display}", expanded=True):
+                if nome_pasta_render_loop in pastas_com_multiplos_usuarios_set_analise:
+                     # Mostra usuários da análise original (df_analise) para esta pasta
+                     nomes_originais_analise = df_analise[df_analise['activity_folder'] == nome_pasta_render_loop]['user_profile_name'].unique()
+                     st.caption(f"👥 Usuários nesta pasta (considerando filtros de pasta/status): {', '.join(nomes_originais_analise)}")
 
-                for _, atividade_row in df_pasta_exibicao_atual.iterrows(): # Renomeado para evitar conflito
-                    atividade = atividade_row.to_dict() # Converter para dict para passar para as funções de dialog
-                    act_id = atividade['activity_id']
-                    links = gerar_links_zflow(act_id)
+                for _, atividade_render_loop in df_pasta_render_loop.iterrows(): # Renomeado
+                    act_id_loop = atividade_render_loop['activity_id'] # Renomeado
+                    links_loop = gerar_links_zflow(act_id_loop) # Renomeado
                     
                     st.markdown("---")
-                    cols_main = st.columns([0.6, 0.4]) 
+                    main_cols_display = st.columns([0.6, 0.4])  # Renomeado
                     
-                    with cols_main[0]:
-                        st.markdown(f"**ID:** `{act_id}` | **Data:** {atividade['activity_date'].strftime('%d/%m/%Y')} | **Status:** `{atividade['activity_status']}`")
-                        st.markdown(f"**Usuário:** {atividade['user_profile_name']}")
+                    with main_cols_display[0]:
+                        st.markdown(f"**ID:** `{act_id_loop}` | **Data:** {atividade_render_loop['activity_date'].strftime('%d/%m/%Y')} | **Status:** `{atividade_render_loop['activity_status']}`")
+                        st.markdown(f"**Usuário:** {atividade_render_loop['user_profile_name']}")
+                        st.text_area("Texto da Publicação:", value=str(atividade_render_loop['Texto']), height=100, key=f"texto_area_{act_id_loop}", disabled=True)
                         
-                        btn_cols_actions = st.columns(3)
-                        if btn_cols_actions[0].button("👁️ Ver Texto", key=f"ver_texto_{act_id}", help="Abrir texto completo da publicação", on_click=abrir_dialog_texto, args=(atividade,)):
-                            pass # Ação é feita pelo on_click
-                        btn_cols_actions[1].link_button("🔗 ZFlow v1", links['antigo'], help="Abrir no ZFlow (versão antiga)")
-                        btn_cols_actions[2].link_button("🔗 ZFlow v2", links['novo'], help="Abrir no ZFlow (versão nova)")
+                        action_btn_cols = st.columns(2) # Renomeado
+                        action_btn_cols[0].link_button("🔗 ZFlow v1", links_loop['antigo'], help="Abrir no ZFlow (versão antiga)", key=f"zflow1_{act_id_loop}")
+                        action_btn_cols[1].link_button("🔗 ZFlow v2", links_loop['novo'], help="Abrir no ZFlow (versão nova)", key=f"zflow2_{act_id_loop}")
 
-                    with cols_main[1]:
-                        duplicatas_da_atividade = similaridades_globais.get(act_id, [])
-                        if duplicatas_da_atividade:
-                            st.markdown(f"**<span style='color:red;'>Potenciais Duplicatas:</span>** ({len(duplicatas_da_atividade)})", unsafe_allow_html=True)
-                            for dup_info in duplicatas_da_atividade:
-                                container_dup_display = st.container(border=True) # Renomeado para evitar conflito
-                                container_dup_display.markdown(
-                                    f"<small><span style='background-color:{dup_info['cor']}; padding: 1px 3px; border-radius: 3px; color: black;'>"
-                                    f"ID: {dup_info['id_similar']} ({dup_info['ratio']:.0%})</span><br>"
-                                    f"Data: {dup_info['data_similar'].strftime('%d/%m')} | Status: `{dup_info['status_similar']}`<br>"
-                                    f"Usuário: {dup_info['usuario_similar']}</small>",
+                    with main_cols_display[1]:
+                        duplicatas_da_atividade_loop = similaridades_globais.get(act_id_loop, []) # Renomeado
+                        if duplicatas_da_atividade_loop:
+                            st.markdown(f"**<span style='color:red;'>Potenciais Duplicatas:</span>** ({len(duplicatas_da_atividade_loop)})", unsafe_allow_html=True)
+                            for dup_info_loop in duplicatas_da_atividade_loop: # Renomeado
+                                dup_container_display = st.container(border=True) # Renomeado
+                                dup_container_display.markdown(
+                                    f"<small><span style='background-color:{dup_info_loop['cor']}; padding: 1px 3px; border-radius: 3px; color: black;'>"
+                                    f"ID: {dup_info_loop['id_similar']} ({dup_info_loop['ratio']:.0%})</span><br>"
+                                    f"Data: {dup_info_loop['data_similar'].strftime('%d/%m')} | Status: `{dup_info_loop['status_similar']}`<br>"
+                                    f"Usuário: {dup_info_loop['usuario_similar']}</small>",
                                     unsafe_allow_html=True
                                 )
-                                atividade_comparar_obj_dict = df_atividades_raw[df_atividades_raw['activity_id'] == dup_info['id_similar']].iloc[0].to_dict()
-                                if container_dup_display.button("⚖️ Comparar Textos", key=f"comparar_{act_id}_com_{dup_info['id_similar']}", help="Comparar textos lado a lado", on_click=abrir_dialog_comparacao, args=(atividade, atividade_comparar_obj_dict)):
-                                    pass # Ação é feita pelo on_click
+                                
+                                # Botão para ativar a comparação
+                                if dup_container_display.button("⚖️ Comparar Textos", key=f"comparar_btn_{act_id_loop}_com_{dup_info_loop['id_similar']}", help="Comparar textos lado a lado"):
+                                    st.session_state.comparacao_ativa = {'id_base': act_id_loop, 'id_comparar': dup_info_loop['id_similar']}
+                                    # Encontrar os dados completos das atividades para comparação
+                                    st.session_state.atividade_base_comparacao = df_atividades_inicial[df_atividades_inicial['activity_id'] == act_id_loop].iloc[0].to_dict()
+                                    st.session_state.atividade_comparar_comparacao = df_atividades_inicial[df_atividades_inicial['activity_id'] == dup_info_loop['id_similar']].iloc[0].to_dict()
+                                    st.rerun() # Força o rerun para exibir a comparação
+
                         elif apenas_potenciais_duplicatas_cb:
                             pass 
                         else:
                             st.markdown(f"<small style='color:green;'>Sem duplicatas (acima de {min_similaridade_display:.0%})</small>", unsafe_allow_html=True)
-        
-# --- Renderização Condicional dos Dialogs (fora do loop principal) ---
-if st.session_state.show_texto_dialog and st.session_state.atividade_para_texto_dialog:
-    with st.dialog("Texto Completo da Atividade",  on_dismiss=fechar_dialog_texto): # Usar on_dismiss para fechar ao clicar fora
-        atividade_selecionada = st.session_state.atividade_para_texto_dialog
-        st.markdown(f"### Texto Completo - Atividade ID: `{atividade_selecionada['activity_id']}`")
-        st.markdown(f"**Pasta:** {atividade_selecionada['activity_folder']} | **Data:** {atividade_selecionada['activity_date'].strftime('%d/%m/%Y')} | **Usuário:** {atividade_selecionada['user_profile_name']} | **Status:** {atividade_selecionada['activity_status']}")
-        st.text_area("Texto da Publicação:", value=str(atividade_selecionada['Texto']), height=400, disabled=True, key=f"full_text_dialog_content_{atividade_selecionada['activity_id']}")
-        if st.button("Fechar Texto", key="fechar_btn_texto_dialog", on_click=fechar_dialog_texto):
-            pass
 
-elif st.session_state.show_comparacao_dialog and st.session_state.atividades_para_comparacao_dialog:
-    atividades_para_comparar = st.session_state.atividades_para_comparacao_dialog
-    base = atividades_para_comparar['base']
-    comparar = atividades_para_comparar['comparar']
-    
-    with st.dialog("Comparação Detalhada de Textos", on_dismiss=fechar_dialog_comparacao): # Usar on_dismiss
-        texto_base_str = str(base['Texto']) # Renomeado para evitar conflito
-        texto_comparar_str = str(comparar['Texto']) # Renomeado para evitar conflito
-        
-        d_compare = difflib.HtmlDiff(wrapcolumn=70) # Renomeado para evitar conflito
-        html_diff_content = d_compare.make_table(texto_base_str.splitlines(), texto_comparar_str.splitlines(),
-                                         fromdesc=f"Texto Atividade ID: {base['activity_id']}",
-                                         todesc=f"Texto Atividade ID: {comparar['activity_id']}")
+                    # Exibir a comparação se ativa para esta atividade base
+                    if st.session_state.comparacao_ativa and st.session_state.comparacao_ativa['id_base'] == act_id_loop:
+                        base_comp = st.session_state.atividade_base_comparacao
+                        comparar_comp = st.session_state.atividade_comparar_comparacao
+                        id_comparado_atual = st.session_state.comparacao_ativa['id_comparar']
 
-        st.markdown(f"### Comparando Atividade `{base['activity_id']}` com `{comparar['activity_id']}`")
-        st.components.v1.html(html_diff_content, height=600, scrolling=True)
-        if st.button("Fechar Comparação", key="fechar_btn_comparacao_dialog", on_click=fechar_dialog_comparacao):
-            pass
+                        st.markdown("---")
+                        st.subheader(f"🔎 Comparação Detalhada: ID `{base_comp['activity_id']}` vs ID `{comparar_comp['activity_id']}`")
+                        
+                        texto_base_comp = str(base_comp['Texto'])
+                        texto_comparar_comp = str(comparar_comp['Texto'])
+                        
+                        html_differ = difflib.HtmlDiff(wrapcolumn=70)
+                        html_comparison = html_differ.make_table(texto_base_comp.splitlines(), texto_comparar_comp.splitlines(),
+                                                             fromdesc=f"Atividade ID: {base_comp['activity_id']}",
+                                                             todesc=f"Atividade ID: {comparar_comp['activity_id']}")
+                        st.components.v1.html(html_comparison, height=600, scrolling=True)
+                        if st.button("Fechar Comparação", key=f"fechar_comp_{act_id_loop}_{id_comparado_atual}"):
+                            st.session_state.comparacao_ativa = None
+                            st.session_state.atividade_base_comparacao = None
+                            st.session_state.atividade_comparar_comparacao = None
+                            st.rerun()
+                        st.markdown("---")
+
+
+        # Limpar estado de comparação se nenhuma comparação estiver ativa (caso o usuário navegue ou mude filtros)
+        # Esta lógica pode precisar de refinamento para não fechar a comparação inesperadamente.
+        # Por enquanto, a comparação é fechada explicitamente pelo botão "Fechar Comparação".
+
 else:
     st.error("Conexão com o banco falhou. Verifique as credenciais e o status do banco.")
 
-st.sidebar.info("Verificador de Duplicidade v2.1")
+st.sidebar.info("Verificador de Duplicidade v3")
+
