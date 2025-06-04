@@ -8,7 +8,7 @@ import io # Para exportação XLSX
 # ==============================================================================
 # CONFIGURAÇÕES E FUNÇÕES AUXILIARES
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade Melhorado")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade Otimizado")
 
 def calcular_similaridade(texto_a, texto_b):
     if texto_a is None or texto_b is None: return 0.0
@@ -66,42 +66,46 @@ def gerar_links_zflow(activity_id):
     return {"antigo": link_antigo, "novo": link_novo}
 
 # ==============================================================================
-# Estado da Sessão para Dialogs e Comparação
+# Estado da Sessão para Dialogs
 # ==============================================================================
-if 'show_texto_dialog_v4' not in st.session_state: # Chaves únicas para esta versão
-    st.session_state.show_texto_dialog_v4 = False
-if 'atividade_para_texto_dialog_v4' not in st.session_state:
-    st.session_state.atividade_para_texto_dialog_v4 = None
+# Usar sufixos para garantir que são estados novos e não conflitantes com execuções anteriores
+if 'show_texto_dialog_v7' not in st.session_state:
+    st.session_state.show_texto_dialog_v7 = False
+if 'atividade_para_texto_dialog_v7' not in st.session_state:
+    st.session_state.atividade_para_texto_dialog_v7 = None
 
-if 'show_comparacao_dialog_v4' not in st.session_state:
-    st.session_state.show_comparacao_dialog_v4 = False
-if 'atividades_para_comparacao_dialog_v4' not in st.session_state:
-    st.session_state.atividades_para_comparacao_dialog_v4 = None
-
-# --- Estado para comparação direta na página (substituindo dialog para comparação) ---
-if 'comparacao_direta_ativa' not in st.session_state:
-    st.session_state.comparacao_direta_ativa = None # Guarda {'id_base': ..., 'id_comparar': ...}
-if 'atividade_base_comparacao_direta' not in st.session_state:
-    st.session_state.atividade_base_comparacao_direta = None
-if 'atividade_comparar_comparacao_direta' not in st.session_state:
-    st.session_state.atividade_comparar_comparacao_direta = None
-
+if 'show_comparacao_dialog_v7' not in st.session_state:
+    st.session_state.show_comparacao_dialog_v7 = False
+if 'atividades_para_comparacao_dialog_v7' not in st.session_state:
+    st.session_state.atividades_para_comparacao_dialog_v7 = None # Guarda {'base': ..., 'comparar': ...}
 
 # ==============================================================================
-# Funções para abrir e fechar dialog de TEXTO
+# Funções para abrir e fechar dialogs
 # ==============================================================================
-def abrir_dialog_texto_v4(atividade):
-    st.session_state.atividade_para_texto_dialog_v4 = atividade
-    st.session_state.show_texto_dialog_v4 = True
+def abrir_dialog_texto(atividade):
+    st.session_state.atividade_para_texto_dialog_v7 = atividade
+    st.session_state.show_texto_dialog_v7 = True
+    # st.rerun() # Geralmente não é necessário, o on_click deve ser suficiente
 
-def fechar_dialog_texto_v4():
-    st.session_state.show_texto_dialog_v4 = False
-    st.session_state.atividade_para_texto_dialog_v4 = None
+def fechar_dialog_texto():
+    st.session_state.show_texto_dialog_v7 = False
+    st.session_state.atividade_para_texto_dialog_v7 = None
+    # st.rerun() # Pode ser necessário se o dialog não fechar visualmente
+
+def abrir_dialog_comparacao(atividade_base, atividade_comparar):
+    st.session_state.atividades_para_comparacao_dialog_v7 = {'base': atividade_base, 'comparar': atividade_comparar}
+    st.session_state.show_comparacao_dialog_v7 = True
+    # st.rerun()
+
+def fechar_dialog_comparacao():
+    st.session_state.show_comparacao_dialog_v7 = False
+    st.session_state.atividades_para_comparacao_dialog_v7 = None
+    # st.rerun()
 
 # ==============================================================================
 # INTERFACE DO USUÁRIO (Streamlit)
 # ==============================================================================
-st.title("🔎 Verificador de Duplicidade Melhorado")
+st.title("🔎 Verificador de Duplicidade Otimizado")
 st.markdown("Análise de atividades 'Verificar' para identificar potenciais duplicidades.")
 
 engine = get_db_engine()
@@ -111,9 +115,9 @@ if engine:
     st.sidebar.header("⚙️ Filtros e Opções")
     hoje = datetime.today().date()
     
-    periodo_selecionado = st.sidebar.radio("Período das atividades:", ("Hoje, Ontem e Amanhã", "Intervalo Personalizado"), key="periodo_radio_v5")
+    periodo_selecionado = st.sidebar.radio("Período das atividades:", ("Hoje, Ontem e Amanhã", "Intervalo Personalizado"), key="periodo_radio_v7")
     data_inicio_filtro, data_fim_filtro = (hoje - timedelta(days=1), hoje + timedelta(days=1)) if periodo_selecionado == "Hoje, Ontem e Amanhã" else \
-                                          (st.sidebar.date_input("Data Início", hoje - timedelta(days=1), key="data_inicio_v5"), st.sidebar.date_input("Data Fim", hoje + timedelta(days=1), key="data_fim_v5"))
+                                          (st.sidebar.date_input("Data Início", hoje - timedelta(days=1), key="data_inicio_v7"), st.sidebar.date_input("Data Fim", hoje + timedelta(days=1), key="data_fim_v7"))
 
     if data_inicio_filtro > data_fim_filtro:
         st.sidebar.error("Data de início posterior à data de fim.")
@@ -127,23 +131,23 @@ if engine:
         st.success(f"{len(df_atividades_inicial)} atividades 'Verificar' (todos os status) carregadas para o período inicial.")
 
         pastas_disponiveis = sorted(df_atividades_inicial['activity_folder'].dropna().unique())
-        pastas_selecionadas = st.sidebar.multiselect("Filtrar por Pasta(s):", pastas_disponiveis, default=[], key="pasta_filter_v5")
+        pastas_selecionadas = st.sidebar.multiselect("Filtrar por Pasta(s):", pastas_disponiveis, default=[], key="pasta_filter_v7")
 
         status_disponiveis = sorted(df_atividades_inicial['activity_status'].dropna().unique())
-        status_selecionados = st.sidebar.multiselect("Filtrar por Status:", status_disponiveis, default=[], key="status_filter_v5")
+        status_selecionados = st.sidebar.multiselect("Filtrar por Status:", status_disponiveis, default=[], key="status_filter_v7")
         
         usuarios_disponiveis = sorted(df_atividades_inicial['user_profile_name'].dropna().unique())
-        usuarios_selecionados_exibicao = st.sidebar.multiselect("Filtrar exibição por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_v5")
+        usuarios_selecionados_exibicao = st.sidebar.multiselect("Filtrar exibição por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_v7")
         
-        min_similaridade_display = st.sidebar.slider("Similaridade de texto mínima (%):", 0, 100, 50, 5, key="sim_slider_v5") / 100.0
+        min_similaridade_display = st.sidebar.slider("Similaridade de texto mínima (%):", 0, 100, 50, 5, key="sim_slider_v7") / 100.0
         
-        apenas_potenciais_duplicatas_cb = st.sidebar.checkbox("Mostrar apenas com potenciais duplicatas", False, key="dup_cb_v5")
-        apenas_usuarios_diferentes_cb = st.sidebar.checkbox("Mostrar apenas pastas com múltiplos usuários (na análise)", False, key="multiuser_cb_v5")
+        apenas_potenciais_duplicatas_cb = st.sidebar.checkbox("Mostrar apenas com potenciais duplicatas", False, key="dup_cb_v7")
+        apenas_usuarios_diferentes_cb = st.sidebar.checkbox("Mostrar apenas pastas com múltiplos usuários (na análise)", False, key="multiuser_cb_v7")
 
         ordem_pastas = st.sidebar.selectbox(
             "Ordenar pastas por:",
             ("Nome da Pasta (A-Z)", "Mais Atividades Primeiro", "Mais Potenciais Duplicatas Primeiro (beta)"),
-            key="ordem_pastas_v5"
+            key="ordem_pastas_v7"
         )
         st.sidebar.markdown("---")
         
@@ -183,8 +187,8 @@ if engine:
                                 'data_similar': base['activity_date'], 'usuario_similar': base['user_profile_name'],
                                 'status_similar': base['activity_status']
                             })
-            for key_sim_v5 in similaridades_globais:
-                similaridades_globais[key_sim_v5] = sorted(similaridades_globais[key_sim_v5], key=lambda x: x['ratio'], reverse=True)
+            for key_sim_v7 in similaridades_globais:
+                similaridades_globais[key_sim_v7] = sorted(similaridades_globais[key_sim_v7], key=lambda x: x['ratio'], reverse=True)
 
         df_exibir_final = df_analise.copy()
         if usuarios_selecionados_exibicao:
@@ -194,22 +198,23 @@ if engine:
         if apenas_usuarios_diferentes_cb:
             df_exibir_final = df_exibir_final[df_exibir_final['activity_folder'].isin(pastas_com_multiplos_usuarios_set_analise)]
 
-        if st.sidebar.button("Exportar Dados Exibidos para XLSX", key="export_xlsx_btn_v5"):
+        if st.sidebar.button("Exportar Dados Exibidos para XLSX", key="export_xlsx_btn_v7"):
             if not df_exibir_final.empty:
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     df_exibir_final.to_excel(writer, index=False, sheet_name='Atividades_Filtradas')
                     duplicatas_export_list = []
-                    for act_id_export_v5, dups_v5 in similaridades_globais.items():
-                        if act_id_export_v5 in df_exibir_final['activity_id'].values:
-                            for dup_info_export_v5 in dups_v5:
+                    ids_para_exportar_duplicatas = df_exibir_final['activity_id'].unique()
+                    for act_id_export_v7 in ids_para_exportar_duplicatas:
+                        if act_id_export_v7 in similaridades_globais:
+                            for dup_info_export_v7 in similaridades_globais[act_id_export_v7]:
                                 duplicatas_export_list.append({
-                                    'ID_Base': act_id_export_v5,
-                                    'ID_Duplicata_Potencial': dup_info_export_v5['id_similar'],
-                                    'Percentual_Similaridade': dup_info_export_v5['ratio'],
-                                    'Data_Duplicata': dup_info_export_v5['data_similar'],
-                                    'Usuario_Duplicata': dup_info_export_v5['usuario_similar'],
-                                    'Status_Duplicata': dup_info_export_v5['status_similar']
+                                    'ID_Base': act_id_export_v7,
+                                    'ID_Duplicata_Potencial': dup_info_export_v7['id_similar'],
+                                    'Percentual_Similaridade': dup_info_export_v7['ratio'],
+                                    'Data_Duplicata': dup_info_export_v7['data_similar'],
+                                    'Usuario_Duplicata': dup_info_export_v7['usuario_similar'],
+                                    'Status_Duplicata': dup_info_export_v7['status_similar']
                                 })
                     if duplicatas_export_list:
                         df_duplicatas_export = pd.DataFrame(duplicatas_export_list)
@@ -231,15 +236,15 @@ if engine:
                 lista_pastas_para_renderizar = pastas_agrupadas_renderizar.size().sort_values(ascending=False).index.tolist()
             elif ordem_pastas == "Mais Potenciais Duplicatas Primeiro (beta)":
                 contagem_duplicatas_pasta_render = {}
-                for nome_pasta_render_v5, df_p_render_v5 in pastas_agrupadas_renderizar:
-                    count_render_v5 = 0
-                    for act_id_render_v5 in df_p_render_v5['activity_id']:
-                        if act_id_render_v5 in similaridades_globais and similaridades_globais[act_id_render_v5]:
-                            count_render_v5 +=1 
+                for nome_pasta_render_v7, df_p_render_v7 in pastas_agrupadas_renderizar:
+                    count_render_v7 = 0
+                    for act_id_render_v7 in df_p_render_v7['activity_id']:
+                        if act_id_render_v7 in similaridades_globais and similaridades_globais[act_id_render_v7]:
+                            count_render_v7 +=1 
                             break 
-                    if count_render_v5 > 0: contagem_duplicatas_pasta_render[nome_pasta_render_v5] = df_p_render_v5[df_p_render_v5['activity_id'].isin(atividades_com_duplicatas_ids)].shape[0]
+                    if count_render_v7 > 0: contagem_duplicatas_pasta_render[nome_pasta_render_v7] = df_p_render_v7[df_p_render_v7['activity_id'].isin(atividades_com_duplicatas_ids)].shape[0]
                 lista_pastas_para_renderizar = sorted(contagem_duplicatas_pasta_render, key=contagem_duplicatas_pasta_render.get, reverse=True)
-                pastas_sem_duplicatas_render = [p_render_v5 for p_render_v5 in pastas_agrupadas_renderizar.groups.keys() if p_render_v5 not in lista_pastas_para_renderizar]
+                pastas_sem_duplicatas_render = [p_render_v7 for p_render_v7 in pastas_agrupadas_renderizar.groups.keys() if p_render_v7 not in lista_pastas_para_renderizar]
                 lista_pastas_para_renderizar.extend(sorted(pastas_sem_duplicatas_render))
 
         st.header("Resultados da Análise")
@@ -248,94 +253,89 @@ if engine:
         elif df_exibir_final.empty :
              st.info("Nenhuma atividade 'Verificar' corresponde aos filtros aplicados.")
 
-        # --- Seção de Comparação (fora do loop de pastas) ---
-        if st.session_state.comparacao_direta_ativa:
-            base_comp_direct = st.session_state.atividade_base_comparacao_direta
-            comparar_comp_direct = st.session_state.atividade_comparar_comparacao_direta
+        for nome_pasta_render_loop_v7 in lista_pastas_para_renderizar:
+            df_pasta_render_loop_v7 = df_exibir_final[df_exibir_final['activity_folder'] == nome_pasta_render_loop_v7]
+            multi_user_info_display_v7 = " (Múltiplos Usuários na Análise)" if nome_pasta_render_loop_v7 in pastas_com_multiplos_usuarios_set_analise else ""
             
-            st.markdown("---")
-            st.subheader(f"🔎 Comparação Detalhada: ID `{base_comp_direct['activity_id']}` vs ID `{comparar_comp_direct['activity_id']}`")
-            
-            texto_base_comp_direct = str(base_comp_direct['Texto'])
-            texto_comparar_comp_direct = str(comparar_comp_direct['Texto'])
-            
-            html_differ_direct = difflib.HtmlDiff(wrapcolumn=70)
-            html_comparison_direct = html_differ_direct.make_table(texto_base_comp_direct.splitlines(), texto_comparar_comp_direct.splitlines(),
-                                                         fromdesc=f"Atividade ID: {base_comp_direct['activity_id']}",
-                                                         todesc=f"Atividade ID: {comparar_comp_direct['activity_id']}")
-            st.components.v1.html(html_comparison_direct, height=600, scrolling=True)
-            if st.button("Fechar Comparação", key=f"fechar_comp_direta_{base_comp_direct['activity_id']}_{comparar_comp_direct['activity_id']}"):
-                st.session_state.comparacao_direta_ativa = None
-                st.session_state.atividade_base_comparacao_direta = None
-                st.session_state.atividade_comparar_comparacao_direta = None
-                st.rerun()
-            st.markdown("---")
+            with st.expander(f"📁 Pasta: {nome_pasta_render_loop_v7} ({len(df_pasta_render_loop_v7)} atividades nesta exibição){multi_user_info_display_v7}", expanded=True):
+                if nome_pasta_render_loop_v7 in pastas_com_multiplos_usuarios_set_analise:
+                     nomes_originais_analise_v7 = df_analise[df_analise['activity_folder'] == nome_pasta_render_loop_v7]['user_profile_name'].unique()
+                     st.caption(f"👥 Usuários nesta pasta (considerando filtros de pasta/status): {', '.join(nomes_originais_analise_v7)}")
 
-
-        for nome_pasta_render_loop_v5 in lista_pastas_para_renderizar:
-            df_pasta_render_loop_v5 = df_exibir_final[df_exibir_final['activity_folder'] == nome_pasta_render_loop_v5]
-            multi_user_info_display_v5 = " (Múltiplos Usuários na Análise)" if nome_pasta_render_loop_v5 in pastas_com_multiplos_usuarios_set_analise else ""
-            
-            with st.expander(f"📁 Pasta: {nome_pasta_render_loop_v5} ({len(df_pasta_render_loop_v5)} atividades nesta exibição){multi_user_info_display_v5}", expanded=True):
-                if nome_pasta_render_loop_v5 in pastas_com_multiplos_usuarios_set_analise:
-                     nomes_originais_analise_v5 = df_analise[df_analise['activity_folder'] == nome_pasta_render_loop_v5]['user_profile_name'].unique()
-                     st.caption(f"👥 Usuários nesta pasta (considerando filtros de pasta/status): {', '.join(nomes_originais_analise_v5)}")
-
-                for _, atividade_render_loop_v5_row in df_pasta_render_loop_v5.iterrows():
-                    atividade_dict_v5 = atividade_render_loop_v5_row.to_dict() # Para passar para on_click
-                    act_id_loop_v5 = atividade_dict_v5['activity_id']
-                    links_loop_v5 = gerar_links_zflow(act_id_loop_v5)
+                for _, atividade_render_loop_v7_row in df_pasta_render_loop_v7.iterrows():
+                    atividade_dict_v7 = atividade_render_loop_v7_row.to_dict()
+                    act_id_loop_v7 = atividade_dict_v7['activity_id']
+                    links_loop_v7 = gerar_links_zflow(act_id_loop_v7)
                     
                     st.markdown("---")
-                    main_cols_display_v5 = st.columns([0.6, 0.4])  
+                    main_cols_display_v7 = st.columns([0.6, 0.4])  
                     
-                    with main_cols_display_v5[0]:
-                        st.markdown(f"**ID:** `{act_id_loop_v5}` | **Data:** {atividade_dict_v5['activity_date'].strftime('%d/%m/%Y')} | **Status:** `{atividade_dict_v5['activity_status']}`")
-                        st.markdown(f"**Usuário:** {atividade_dict_v5['user_profile_name']}")
-                        st.text_area("Texto da Publicação:", value=str(atividade_dict_v5['Texto']), height=100, key=f"texto_area_{act_id_loop_v5}", disabled=True)
+                    with main_cols_display_v7[0]:
+                        st.markdown(f"**ID:** `{act_id_loop_v7}` | **Data:** {atividade_dict_v7['activity_date'].strftime('%d/%m/%Y')} | **Status:** `{atividade_dict_v7['activity_status']}`")
+                        st.markdown(f"**Usuário:** {atividade_dict_v7['user_profile_name']}")
+                        # Texto da publicação exibido diretamente
+                        st.text_area("Texto da Publicação:", value=str(atividade_dict_v7['Texto']), height=100, key=f"texto_area_v7_{act_id_loop_v7}", disabled=True)
                         
-                        action_btn_cols_v5 = st.columns(3)
-                        # Botão Ver Texto agora usa o dialog
-                        if action_btn_cols_v5[0].button("👁️ Ver Texto", key=f"ver_texto_btn_{act_id_loop_v5}", help="Abrir texto completo da publicação", on_click=abrir_dialog_texto_v4, args=(atividade_dict_v5,)):
-                            pass # Ação é feita pelo on_click
-                        action_btn_cols_v5[1].link_button("� ZFlow v1", links_loop_v5['antigo'], help="Abrir no ZFlow (versão antiga)") # Removido 'key'
-                        action_btn_cols_v5[2].link_button("🔗 ZFlow v2", links_loop_v5['novo'], help="Abrir no ZFlow (versão nova)") # Removido 'key'
+                        action_btn_cols_v7 = st.columns(3)
+                        if action_btn_cols_v7[0].button("👁️ Ver Texto Completo", key=f"ver_texto_completo_btn_v7_{act_id_loop_v7}", help="Abrir texto completo da publicação em um dialog", on_click=abrir_dialog_texto, args=(atividade_dict_v7,)):
+                            pass 
+                        action_btn_cols_v7[1].link_button("🔗 ZFlow v1", links_loop_v7['antigo'], help="Abrir no ZFlow (versão antiga)")
+                        action_btn_cols_v7[2].link_button("🔗 ZFlow v2", links_loop_v7['novo'], help="Abrir no ZFlow (versão nova)")
 
-                    with main_cols_display_v5[1]:
-                        duplicatas_da_atividade_loop_v5 = similaridades_globais.get(act_id_loop_v5, [])
-                        if duplicatas_da_atividade_loop_v5:
-                            st.markdown(f"**<span style='color:red;'>Potenciais Duplicatas:</span>** ({len(duplicatas_da_atividade_loop_v5)})", unsafe_allow_html=True)
-                            for dup_info_loop_v5 in duplicatas_da_atividade_loop_v5:
-                                dup_container_display_v5 = st.container(border=True)
-                                dup_container_display_v5.markdown(
-                                    f"<small><span style='background-color:{dup_info_loop_v5['cor']}; padding: 1px 3px; border-radius: 3px; color: black;'>"
-                                    f"ID: {dup_info_loop_v5['id_similar']} ({dup_info_loop_v5['ratio']:.0%})</span><br>"
-                                    f"Data: {dup_info_loop_v5['data_similar'].strftime('%d/%m')} | Status: `{dup_info_loop_v5['status_similar']}`<br>"
-                                    f"Usuário: {dup_info_loop_v5['usuario_similar']}</small>",
+                    with main_cols_display_v7[1]:
+                        duplicatas_da_atividade_loop_v7 = similaridades_globais.get(act_id_loop_v7, [])
+                        if duplicatas_da_atividade_loop_v7:
+                            st.markdown(f"**<span style='color:red;'>Potenciais Duplicatas:</span>** ({len(duplicatas_da_atividade_loop_v7)})", unsafe_allow_html=True)
+                            for dup_info_loop_v7 in duplicatas_da_atividade_loop_v7:
+                                dup_container_display_v7 = st.container(border=True)
+                                dup_container_display_v7.markdown(
+                                    f"<small><span style='background-color:{dup_info_loop_v7['cor']}; padding: 1px 3px; border-radius: 3px; color: black;'>"
+                                    f"ID: {dup_info_loop_v7['id_similar']} ({dup_info_loop_v7['ratio']:.0%})</span><br>"
+                                    f"Data: {dup_info_loop_v7['data_similar'].strftime('%d/%m')} | Status: `{dup_info_loop_v7['status_similar']}`<br>"
+                                    f"Usuário: {dup_info_loop_v7['usuario_similar']}</small>",
                                     unsafe_allow_html=True
                                 )
                                 
-                                if dup_container_display_v5.button("⚖️ Comparar Textos", key=f"comparar_btn_direto_{act_id_loop_v5}_com_{dup_info_loop_v5['id_similar']}", help="Comparar textos lado a lado"):
-                                    st.session_state.comparacao_direta_ativa = {'id_base': act_id_loop_v5, 'id_comparar': dup_info_loop_v5['id_similar']}
-                                    st.session_state.atividade_base_comparacao_direta = df_atividades_inicial[df_atividades_inicial['activity_id'] == act_id_loop_v5].iloc[0].to_dict()
-                                    st.session_state.atividade_comparar_comparacao_direta = df_atividades_inicial[df_atividades_inicial['activity_id'] == dup_info_loop_v5['id_similar']].iloc[0].to_dict()
-                                    st.rerun()
+                                # Botão para abrir dialog de comparação
+                                atividade_base_para_dialog = atividade_dict_v7 # A atividade atual
+                                atividade_comparar_para_dialog = df_atividades_inicial[df_atividades_inicial['activity_id'] == dup_info_loop_v7['id_similar']].iloc[0].to_dict()
+                                if dup_container_display_v7.button("⚖️ Comparar em Dialog", key=f"comparar_dialog_btn_v7_{act_id_loop_v7}_com_{dup_info_loop_v7['id_similar']}", help="Comparar textos lado a lado em um dialog", on_click=abrir_dialog_comparacao, args=(atividade_base_para_dialog, atividade_comparar_para_dialog)):
+                                    pass
                         elif apenas_potenciais_duplicatas_cb:
                             pass 
                         else:
                             st.markdown(f"<small style='color:green;'>Sem duplicatas (acima de {min_similaridade_display:.0%})</small>", unsafe_allow_html=True)
 
-        # --- Renderização Condicional do Dialog de TEXTO (fora do loop principal) ---
-        if st.session_state.show_texto_dialog_v4 and st.session_state.atividade_para_texto_dialog_v4:
-            # Removido on_dismiss pois não era suportado
+        # --- Renderização Condicional dos Dialogs (fora do loop principal) ---
+        # Dialog para "Ver Texto Completo"
+        if st.session_state.show_texto_dialog_v7 and st.session_state.atividade_para_texto_dialog_v7:
             with st.dialog("Texto Completo da Atividade"): 
-                atividade_selecionada_v5 = st.session_state.atividade_para_texto_dialog_v4
-                st.markdown(f"### Texto Completo - Atividade ID: `{atividade_selecionada_v5['activity_id']}`")
-                st.markdown(f"**Pasta:** {atividade_selecionada_v5['activity_folder']} | **Data:** {atividade_selecionada_v5['activity_date'].strftime('%d/%m/%Y')} | **Usuário:** {atividade_selecionada_v5['user_profile_name']} | **Status:** {atividade_selecionada_v5['activity_status']}")
-                st.text_area("Texto da Publicação:", value=str(atividade_selecionada_v5['Texto']), height=400, disabled=True, key=f"full_text_dialog_content_v5_{atividade_selecionada_v5['activity_id']}")
-                if st.button("Fechar Texto", key="fechar_btn_texto_dialog_v5", on_click=fechar_dialog_texto_v4):
-                    pass # Ação é feita pelo on_click, que chama st.rerun() implicitamente
+                atividade_dialog_texto_v7 = st.session_state.atividade_para_texto_dialog_v7
+                st.markdown(f"### Texto Completo - Atividade ID: `{atividade_dialog_texto_v7['activity_id']}`")
+                st.markdown(f"**Pasta:** {atividade_dialog_texto_v7['activity_folder']} | **Data:** {atividade_dialog_texto_v7['activity_date'].strftime('%d/%m/%Y')} | **Usuário:** {atividade_dialog_texto_v7['user_profile_name']} | **Status:** {atividade_dialog_texto_v7['activity_status']}")
+                st.text_area("Texto da Publicação:", value=str(atividade_dialog_texto_v7['Texto']), height=400, disabled=True, key=f"full_text_dialog_content_v7_{atividade_dialog_texto_v7['activity_id']}")
+                if st.button("Fechar Texto", key="fechar_btn_texto_dialog_v7", on_click=fechar_dialog_texto): # Corrigido para chamar a função correta
+                    pass 
+        
+        # Dialog para "Comparar Textos"
+        if st.session_state.show_comparacao_dialog_v7 and st.session_state.atividades_para_comparacao_dialog_v7:
+            with st.dialog("Comparação Detalhada de Textos"):
+                atividades_para_comparar_v7 = st.session_state.atividades_para_comparacao_dialog_v7
+                base_v7 = atividades_para_comparar_v7['base']
+                comparar_v7 = atividades_para_comparar_v7['comparar']
+            
+                st.markdown(f"### Comparando Atividade `{base_v7['activity_id']}` com `{comparar_v7['activity_id']}`")
+                texto_base_v7 = str(base_v7['Texto'])
+                texto_comparar_v7 = str(comparar_v7['Texto'])
+                
+                html_differ_v7 = difflib.HtmlDiff(wrapcolumn=70)
+                html_comparison_v7 = html_differ_v7.make_table(texto_base_v7.splitlines(), texto_comparar_v7.splitlines(),
+                                                             fromdesc=f"Atividade ID: {base_v7['activity_id']}",
+                                                             todesc=f"Atividade ID: {comparar_v7['activity_id']}")
+                st.components.v1.html(html_comparison_v7, height=600, scrolling=True)
+                if st.button("Fechar Comparação", key="fechar_btn_comparacao_dialog_v7", on_click=fechar_dialog_comparacao):
+                    pass
 else:
     st.error("Conexão com o banco falhou. Verifique as credenciais e o status do banco.")
 
-st.sidebar.info("Verificador de Duplicidade v3.1")
+st.sidebar.info("Verificador de Duplicidade v4 - Otimizado")
