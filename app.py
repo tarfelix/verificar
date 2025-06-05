@@ -7,12 +7,12 @@ from datetime import datetime, timedelta, date
 from unidecode import unidecode
 from rapidfuzz import fuzz
 import io
-import difflib # Importar HtmlDiff
+import difflib 
 
 # ==============================================================================
 # CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (HtmlDiff)")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade Otimizado")
 
 # ==============================================================================
 # FUNÇÕES AUXILIARES
@@ -28,7 +28,7 @@ def calcular_similaridade(texto_a: str, texto_b: str) -> float:
     norm_a = normalizar_texto(texto_a)
     norm_b = normalizar_texto(texto_b)
     if not norm_a or not norm_b: return 0.0
-    if abs(len(norm_a) - len(norm_b)) > 0.3 * max(len(norm_a), len(norm_b)):
+    if abs(len(norm_a) - len(norm_b)) > 0.3 * max(len(norm_a), len(norm_b)): # Heurística
         return 0.0
     return fuzz.token_set_ratio(norm_a, norm_b) / 100.0
 
@@ -68,8 +68,8 @@ def get_db_engine() -> Engine | None:
 
 @st.cache_data(ttl=3600)
 def carregar_dados_ajustados(_engine: Engine) -> tuple[pd.DataFrame | None, Exception | None]:
-    hoje = date.today() # Usar date de datetime
-    data_limite_historico = hoje - timedelta(days=7)
+    hoje_dt = date.today() # Renomeado para clareza
+    data_limite_historico = hoje_dt - timedelta(days=7)
     query_abertas = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto, activity_type
         FROM ViewGrdAtividadesTarcisio WHERE activity_type = 'Verificar' AND activity_status = 'Aberta'
@@ -95,7 +95,7 @@ def carregar_dados_ajustados(_engine: Engine) -> tuple[pd.DataFrame | None, Exce
 # ==============================================================================
 # Estado da Sessão para Dialogs
 # ==============================================================================
-SUFFIX_DIALOG = "_html_diff_dialog" 
+SUFFIX_DIALOG = "_dialog_ajustes" 
 if f'show_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
     st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False
 if f'atividade_para_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
@@ -113,34 +113,30 @@ if f'atividades_para_comparacao{SUFFIX_DIALOG}' not in st.session_state:
 def mostrar_texto_completo_dialog():
     atividade_data = st.session_state[f'atividade_para_texto_dialog{SUFFIX_DIALOG}']
     if atividade_data:
-        st.markdown(f"### Texto Completo - Atividade ID: `{atividade_data['activity_id']}`")
+        st.markdown(f"### Texto Completo - ID: `{atividade_data['activity_id']}`")
         st.markdown(f"**Pasta:** {atividade_data['activity_folder']} | **Data:** {atividade_data['activity_date'].strftime('%d/%m/%Y %H:%M')} | **Usuário:** {atividade_data['user_profile_name']} | **Status:** {atividade_data['activity_status']}")
-        st.text_area("Texto da Publicação:", value=str(atividade_data['Texto']), height=400, disabled=True, key=f"dialog_texto_content{SUFFIX_DIALOG}_{atividade_data['activity_id']}")
-        if st.button("Fechar Texto", key=f"fechar_dialog_texto_btn{SUFFIX_DIALOG}"):
-            st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False
-            st.rerun()
+        st.text_area("Texto:", value=str(atividade_data['Texto']), height=400, disabled=True, key=f"dialog_txt_content{SUFFIX_DIALOG}_{atividade_data['activity_id']}")
+        if st.button("Fechar Texto", key=f"fechar_dialog_txt_btn{SUFFIX_DIALOG}"):
+            st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False; st.rerun()
 
 @st.dialog("Comparação Detalhada de Textos", width="large")
-def mostrar_comparacao_html_diff_dialog(): # Renomeada para clareza
+def mostrar_comparacao_html_diff_dialog():
     atividades_comp_data = st.session_state[f'atividades_para_comparacao{SUFFIX_DIALOG}']
     if atividades_comp_data:
         base_comp = atividades_comp_data['base']
         comparar_comp = atividades_comp_data['comparar']
-    
         st.markdown(f"### Comparando ID `{base_comp['activity_id']}` com ID `{comparar_comp['activity_id']}`")
-        
         texto_base_comp = str(base_comp['Texto'])
         texto_comparar_comp = str(comparar_comp['Texto'])
         
-        differ = difflib.HtmlDiff(wrapcolumn=80) 
+        # Tentar wrapcolumn menor para melhor ajuste na largura do dialog
+        differ = difflib.HtmlDiff(wrapcolumn=65, linejunk=difflib.IS_LINE_JUNK, charjunk=difflib.IS_CHARACTER_JUNK) 
         html_comparison = differ.make_table(texto_base_comp.splitlines(), texto_comparar_comp.splitlines(),
-                                             fromdesc=f"Texto Atividade ID: {base_comp['activity_id']}", 
-                                             todesc=f"Texto Atividade ID: {comparar_comp['activity_id']}")
-        st.components.v1.html(html_comparison, height=600, scrolling=True)
-
+                                             fromdesc=f"ID: {base_comp['activity_id']}", 
+                                             todesc=f"ID: {comparar_comp['activity_id']}")
+        st.components.v1.html(html_comparison, height=550, scrolling=True) # Altura um pouco menor
         if st.button("Fechar Comparação", key=f"fechar_dialog_html_comp_btn{SUFFIX_DIALOG}"):
-            st.session_state[f'show_comparacao_dialog{SUFFIX_DIALOG}'] = False
-            st.rerun()
+            st.session_state[f'show_comparacao_dialog{SUFFIX_DIALOG}'] = False; st.rerun()
 
 # ==============================================================================
 # Funções para abrir os dialogs
@@ -149,7 +145,7 @@ def on_click_ver_texto_completo(atividade):
     st.session_state[f'atividade_para_texto_dialog{SUFFIX_DIALOG}'] = atividade
     st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = True
 
-def on_click_comparar_textos_html_dialog(atividade_base, atividade_comparar): # Renomeada
+def on_click_comparar_textos_html_dialog(atividade_base, atividade_comparar):
     st.session_state[f'atividades_para_comparacao{SUFFIX_DIALOG}'] = {'base': atividade_base, 'comparar': atividade_comparar}
     st.session_state[f'show_comparacao_dialog{SUFFIX_DIALOG}'] = True
 
@@ -158,32 +154,29 @@ def on_click_comparar_textos_html_dialog(atividade_base, atividade_comparar): # 
 # ==============================================================================
 def app_principal():
     st.sidebar.success(f"Logado como: **{st.session_state['username']}**")
-    if st.sidebar.button("Logout", key=f"logout_button{SUFFIX_DIALOG}_main"):
+    if st.sidebar.button("Logout", key=f"logout_btn{SUFFIX_DIALOG}"):
         for key_state in list(st.session_state.keys()): del st.session_state[key_state]
         st.rerun()
 
-    st.title("🔎 Verificador de Duplicidade (HtmlDiff)")
+    st.title("🔎 Verificador de Duplicidade (HtmlDiff no Dialog)")
     st.markdown("Análise de atividades 'Verificar' para identificar potenciais duplicidades.")
 
     engine = get_db_engine()
     if not engine: st.error("Falha crítica na conexão com o banco."); st.stop()
 
     st.sidebar.header("⚙️ Filtros e Opções")
-    
-    if st.sidebar.button("🔄 Atualizar Dados do Banco", help="Busca os dados mais recentes.", key=f"buscar_btn_main{SUFFIX_DIALOG}"):
-        carregar_dados_ajustados.clear(); st.toast("Buscando dados atualizados...", icon="🔄")
+    if st.sidebar.button("🔄 Atualizar Dados Base", help="Busca os dados mais recentes.", key=f"buscar_btn_main{SUFFIX_DIALOG}"):
+        carregar_dados_ajustados.clear(); st.toast("Buscando dados atualizados...", icon="�")
     
     df_raw_total, erro_db = carregar_dados_ajustados(engine)
-
     if erro_db: st.error("Erro ao carregar dados."); st.exception(erro_db); st.stop()
-    if df_raw_total is None or df_raw_total.empty:
-        st.warning("Nenhuma atividade 'Verificar' retornada."); st.stop()
+    if df_raw_total is None or df_raw_total.empty: st.warning("Nenhuma atividade 'Verificar' retornada."); st.stop()
 
     st.sidebar.markdown("---"); st.sidebar.subheader("1. Filtro de Período")
-    hoje_data = date.today() # Usar date de datetime
-    data_inicio_padrao = hoje_data - timedelta(days=1)
-    datas_abertas_futuras = df_raw_total[(df_raw_total['activity_status'] == 'Aberta') & (df_raw_total['activity_date'].dt.date > hoje_data)]['activity_date'].dt.date
-    data_fim_padrao = datas_abertas_futuras.max() if not datas_abertas_futuras.empty else hoje_data + timedelta(days=14) # Aumentado para 14 dias
+    hoje = date.today()
+    data_inicio_padrao = hoje - timedelta(days=1)
+    datas_abertas_futuras = df_raw_total[(df_raw_total['activity_status'] == 'Aberta') & (df_raw_total['activity_date'].dt.date > hoje)]['activity_date'].dt.date
+    data_fim_padrao = datas_abertas_futuras.max() if not datas_abertas_futuras.empty else hoje + timedelta(days=14)
     if data_inicio_padrao > data_fim_padrao: data_inicio_padrao = data_fim_padrao - timedelta(days=1)
 
     data_inicio_selecionada = st.sidebar.date_input("Data de Início", value=data_inicio_padrao, key=f"di_main{SUFFIX_DIALOG}")
@@ -215,34 +208,58 @@ def app_principal():
     usuarios_disp_ex = sorted(df_para_analise['user_profile_name'].dropna().unique()) if not df_para_analise.empty else []
     usuarios_sel = st.sidebar.multiselect("Exibir Usuário(s):", usuarios_disp_ex, default=[], key=f"user_sel{SUFFIX_DIALOG}_main")
 
-    ids_com_duplicatas = set()
-    todas_similaridades = []
+    # Armazenar todas as similaridades calculadas para o df_para_analise
+    # Isso é feito uma vez aqui, em vez de repetidamente no loop de exibição.
+    map_id_para_similaridades = {}
+    atividades_com_duplicatas_calculadas = set()
 
     if not df_para_analise.empty and len(df_para_analise) > 1:
         prog_placeholder = st.sidebar.empty(); prog_bar = st.sidebar.progress(0)
-        total_a_analisar = df_para_analise['activity_folder'].nunique(); prog_count = 0
-        for nome_pasta_iter, df_pasta_iter in df_para_analise.groupby('activity_folder'):
-            prog_placeholder.text(f"Analisando pasta: {nome_pasta_iter}...")
-            if len(df_pasta_iter) < 2: 
-                prog_count +=1
-                if total_a_analisar > 0: prog_bar.progress(prog_count/total_a_analisar)
+        total_pastas = df_para_analise['activity_folder'].nunique(); pastas_processadas = 0
+        
+        for nome_pasta_calc, df_pasta_calc in df_para_analise.groupby('activity_folder'):
+            prog_placeholder.text(f"Analisando Pasta: {nome_pasta_calc}...")
+            if len(df_pasta_calc) < 2:
+                pastas_processadas += 1
+                if total_pastas > 0: prog_bar.progress(pastas_processadas / total_pastas)
                 continue
-            atividades_lista = df_pasta_iter.to_dict('records')
-            for i in range(len(atividades_lista)):
-                for j in range(i + 1, len(atividades_lista)):
-                    base, comparar = atividades_lista[i], atividades_lista[j]
+
+            atividades_nesta_pasta = df_pasta_calc.to_dict('records')
+            for i in range(len(atividades_nesta_pasta)):
+                base = atividades_nesta_pasta[i]
+                if base['activity_id'] not in map_id_para_similaridades:
+                    map_id_para_similaridades[base['activity_id']] = []
+
+                for j in range(i + 1, len(atividades_nesta_pasta)):
+                    comparar = atividades_nesta_pasta[j]
                     similaridade = calcular_similaridade(base['Texto'], comparar['Texto'])
                     if similaridade >= min_sim:
+                        atividades_com_duplicatas_calculadas.add(base['activity_id'])
+                        atividades_com_duplicatas_calculadas.add(comparar['activity_id'])
                         cor = obter_cor_similaridade(similaridade)
-                        todas_similaridades.append({'id_base': base['activity_id'], 'id_similar': comparar['activity_id'], 'ratio': similaridade, 'cor': cor})
-                        ids_com_duplicatas.add(base['activity_id']); ids_com_duplicatas.add(comparar['activity_id'])
-            prog_count +=1
-            if total_a_analisar > 0: prog_bar.progress(prog_count/total_a_analisar)
+                        
+                        # Adiciona a info da duplicata à atividade base
+                        map_id_para_similaridades[base['activity_id']].append({
+                            'id_similar': comparar['activity_id'], 'ratio': similaridade, 'cor': cor
+                        })
+                        # Adiciona a info da base à atividade similar (para referência cruzada se necessário)
+                        if comparar['activity_id'] not in map_id_para_similaridades:
+                             map_id_para_similaridades[comparar['activity_id']] = []
+                        map_id_para_similaridades[comparar['activity_id']].append({
+                            'id_similar': base['activity_id'], 'ratio': similaridade, 'cor': cor
+                        })
+            pastas_processadas += 1
+            if total_pastas > 0: prog_bar.progress(pastas_processadas / total_pastas)
+        
         prog_bar.empty(); prog_placeholder.text("Análise de similaridade concluída.")
-    df_similaridades = pd.DataFrame(todas_similaridades)
+
+        # Ordenar as listas de similaridades por 'ratio'
+        for act_id_sort in map_id_para_similaridades: # Renomeado para evitar conflito
+            map_id_para_similaridades[act_id_sort] = sorted(map_id_para_similaridades[act_id_sort], key=lambda x: x['ratio'], reverse=True)
+
 
     df_exibir = df_para_analise.copy()
-    if apenas_dup: df_exibir = df_exibir[df_exibir['activity_id'].isin(ids_com_duplicatas)]
+    if apenas_dup: df_exibir = df_exibir[df_exibir['activity_id'].isin(atividades_com_duplicatas_calculadas)]
     if apenas_multi: df_exibir = df_exibir[df_exibir['activity_folder'].isin(pastas_multi_user)]
     if usuarios_sel: df_exibir = df_exibir[df_exibir['user_profile_name'].isin(usuarios_sel)]
 
@@ -252,14 +269,30 @@ def app_principal():
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_exibir.to_excel(writer, index=False, sheet_name='Atividades_Exibidas')
-                if not df_similaridades.empty:
-                    df_sim_export = df_similaridades[df_similaridades['id_base'].isin(df_exibir['activity_id'])]
-                    if not df_sim_export.empty:
-                        df_sim_export = pd.merge(df_sim_export, df_atividades_periodo[['activity_id', 'activity_date', 'user_profile_name', 'activity_status']].rename(
-                            columns={'activity_id': 'id_similar', 'activity_date': 'data_similar',
-                                     'user_profile_name': 'usuario_similar', 'activity_status': 'status_similar'}),
-                            on='id_similar', how='left')
-                        df_sim_export.to_excel(writer, index=False, sheet_name='Detalhes_Duplicatas')
+                
+                # Preparar dados para a aba de duplicatas
+                lista_export_duplicatas = []
+                if map_id_para_similaridades: # Verifica se há alguma similaridade calculada
+                    for id_base_export, lista_similares_export in map_id_para_similaridades.items():
+                        if id_base_export in df_exibir['activity_id'].values: # Apenas para atividades exibidas
+                            for sim_info_export in lista_similares_export:
+                                # Busca detalhes da atividade similar no df_atividades_periodo (que tem todos os dados do período)
+                                detalhes_similar_export_rows = df_atividades_periodo[df_atividades_periodo['activity_id'] == sim_info_export['id_similar']]
+                                if not detalhes_similar_export_rows.empty:
+                                    detalhes_similar_export = detalhes_similar_export_rows.iloc[0]
+                                    lista_export_duplicatas.append({
+                                        'ID_Base': id_base_export,
+                                        'ID_Duplicata_Potencial': sim_info_export['id_similar'],
+                                        'Percentual_Similaridade': sim_info_export['ratio'],
+                                        'Cor_Similaridade': sim_info_export['cor'],
+                                        'Data_Duplicata': detalhes_similar_export['activity_date'].strftime('%Y-%m-%d %H:%M'),
+                                        'Usuario_Duplicata': detalhes_similar_export['user_profile_name'],
+                                        'Status_Duplicata': detalhes_similar_export['activity_status']
+                                    })
+                    if lista_export_duplicatas:
+                        df_duplicatas_export = pd.DataFrame(lista_export_duplicatas)
+                        df_duplicatas_export.to_excel(writer, index=False, sheet_name='Detalhes_Duplicatas')
+
             st.sidebar.download_button("Baixar XLSX", output.getvalue(), f"duplicatas_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else: st.sidebar.warning("Nenhum dado para exportar.")
 
@@ -290,29 +323,31 @@ def app_principal():
                     btn_cols[2].link_button("🔗 ZFlow v2", links['novo'])
 
                 with col_sim_display:
-                    similares = df_similaridades[df_similaridades['id_base'] == atividade['activity_id']] if not df_similaridades.empty else pd.DataFrame()
-                    if not similares.empty:
-                        st.markdown(f"**<span style='color:red;'>Duplicatas:</span>** ({len(similares)})", unsafe_allow_html=True)
-                        for _, sim_data in similares.sort_values(by='ratio', ascending=False).iterrows():
+                    similares_para_esta_atividade = map_id_para_similaridades.get(atividade['activity_id'], [])
+                    if similares_para_esta_atividade:
+                        st.markdown(f"**<span style='color:red;'>Duplicatas (Intra-Pasta):</span>** ({len(similares_para_esta_atividade)})", unsafe_allow_html=True)
+                        for sim_data in similares_para_esta_atividade: # Já está ordenado
+                            # Busca detalhes da atividade similar no df_atividades_periodo
                             info_dupe_rows = df_atividades_periodo[df_atividades_periodo['activity_id'] == sim_data['id_similar']]
                             if not info_dupe_rows.empty:
-                                info_dupe = info_dupe_rows.iloc[0].to_dict()
+                                info_dupe = info_dupe_rows.iloc[0].to_dict() # Convertido para dict
                                 container_dup = st.container(border=True)
                                 container_dup.markdown(f"""<small><div style='background-color:{sim_data['cor']}; padding: 3px 6px; border-radius: 5px; color: black; margin-bottom: 5px; font-weight: 500;'>
                                 <b>ID: {info_dupe['activity_id']} ({sim_data['ratio']:.0%})</b><br>
-                                Data: {info_dupe['activity_date'].strftime('%d/%m/%y')} | Status: {info_dupe['activity_status']}<br>
+                                Data: {info_dupe['activity_date'].strftime('%d/%m/%y %H:%M')} | Status: {info_dupe['activity_status']}<br>
                                 Usuário: {info_dupe['user_profile_name']}
                                 </div></small>""", unsafe_allow_html=True)
                                 # Botão para abrir o dialog de comparação HtmlDiff
                                 if container_dup.button("⚖️ Comparar (Detalhado)", key=f"comp_html_dialog_btn{SUFFIX_DIALOG}_{atividade['activity_id']}_{info_dupe['activity_id']}", on_click=on_click_comparar_textos_html_dialog, args=(atividade, info_dupe)): pass
-                            else: st.caption(f"Detalhes da ID {sim_data['id_similar']} não disponíveis.")
+                            else: st.caption(f"Detalhes da ID {sim_data['id_similar']} não disponíveis (fora do período de datas ou filtros de análise).")
                     else:
-                        if not apenas_dup: st.markdown("**<span style='color:green;'>Sem duplicatas</span>**", unsafe_allow_html=True)
+                        if not apenas_dup: st.markdown("**<span style='color:green;'>Sem duplicatas (nesta análise)</span>**", unsafe_allow_html=True)
 
+    # Chamar as funções de dialog aqui, se o estado correspondente for True
     if st.session_state.get(f'show_texto_dialog{SUFFIX_DIALOG}', False):
         mostrar_texto_completo_dialog()
     if st.session_state.get(f'show_comparacao_dialog{SUFFIX_DIALOG}', False):
-        mostrar_comparacao_html_diff_dialog() # Chama a função com HtmlDiff
+        mostrar_comparacao_html_diff_dialog()
 
 # ==============================================================================
 # LÓGICA DE LOGIN
@@ -341,3 +376,4 @@ if __name__ == "__main__":
     if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
     if st.session_state["logged_in"]: app_principal()
     else: login_form()
+�
