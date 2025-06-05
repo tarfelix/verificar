@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 from sqlalchemy import create_engine, text, exc
-from sqlalchemy.engine import Engine # Importar Engine para hash_funcs
+from sqlalchemy.engine import Engine
 from datetime import datetime, timedelta, date 
 from unidecode import unidecode
 from rapidfuzz import fuzz
@@ -12,7 +12,7 @@ import difflib
 # ==============================================================================
 # CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Estável)")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Ajustes Finais)")
 
 # ==============================================================================
 # FUNÇÕES AUXILIARES
@@ -67,17 +67,28 @@ def get_db_engine() -> Engine | None:
         return None 
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
-def carregar_dados(eng_param: Engine) -> tuple[pd.DataFrame | None, Exception | None]:
+def carregar_dados_base(eng_param: Engine) -> tuple[pd.DataFrame | None, Exception | None]:
+    """
+    Carrega:
+    1. Todas as atividades 'Verificar' com status 'Aberta' (sem limite de data futura).
+    2. Todas as atividades 'Verificar' dos últimos 7 dias (qualquer status).
+    Combina e remove duplicatas.
+    """
     hoje_dt = date.today()
     data_limite_historico = hoje_dt - timedelta(days=7)
+    
+    # Query 1: Todas as Abertas (Verificar), sem filtro de data futura
     query_abertas = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto, activity_type
         FROM ViewGrdAtividadesTarcisio WHERE activity_type = 'Verificar' AND activity_status = 'Aberta'
     """)
+    
+    # Query 2: Histórico dos últimos 7 dias (Verificar, qualquer status)
     query_historico = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto, activity_type
         FROM ViewGrdAtividadesTarcisio WHERE activity_type = 'Verificar' AND DATE(activity_date) >= :data_limite
     """)
+    
     try:
         with eng_param.connect() as connection:
             df_abertas = pd.read_sql(query_abertas, connection)
@@ -86,28 +97,23 @@ def carregar_dados(eng_param: Engine) -> tuple[pd.DataFrame | None, Exception | 
         df_combinado = pd.concat([df_abertas, df_historico], ignore_index=True)
 
         if df_combinado.empty:
-            # Retorna um DataFrame vazio com as colunas e tipos corretos se não houver dados
             cols = ['activity_id', 'activity_folder', 'user_profile_name', 'activity_date', 'activity_status', 'Texto', 'activity_type']
             df_final = pd.DataFrame(columns=cols)
-            df_final['activity_date'] = pd.Series(dtype='datetime64[ns]')
-            df_final['Texto'] = pd.Series(dtype='object')
-            # Garanta que outras colunas importantes tenham tipos definidos se necessário
-            for col in ['activity_id', 'user_profile_name', 'activity_folder', 'activity_status', 'activity_type']:
-                if col not in df_final.columns: # Adicionado para garantir que a coluna existe
-                    df_final[col] = pd.Series(dtype='object') # Ou o tipo apropriado
+            for col in cols: df_final[col] = pd.Series(dtype='object') # Tipagem genérica para evitar erros
+            df_final['activity_date'] = pd.to_datetime(df_final['activity_date'], errors='coerce')
             df_final['Texto'] = df_final['Texto'].astype(str).fillna('')
             return df_final, None
 
+        # Priorizar 'Aberta' se houver IDs duplicados e garantir tipos corretos
+        df_combinado['activity_date'] = pd.to_datetime(df_combinado['activity_date'], errors='coerce')
         df_combinado_sorted = df_combinado.sort_values(by=['activity_id', 'activity_status'], ascending=[True, True])
         df_final_temp = df_combinado_sorted.drop_duplicates(subset=['activity_id'], keep='first')
         
         df_final = df_final_temp.sort_values(by=['activity_folder', 'activity_date', 'activity_id'], ascending=[True, False, False]).copy()
         
-        # --- CORREÇÃO APLICADA AQUI ---
-        # Forçar a conversão para datetime, transformando erros em NaT (Not a Time)
+        # Re-assegurar tipos após manipulações
         df_final['activity_date'] = pd.to_datetime(df_final['activity_date'], errors='coerce')
         df_final['Texto'] = df_final['Texto'].astype(str).fillna('')
-        
         return df_final, None
     except exc.SQLAlchemyError as e:
         return None, e
@@ -115,7 +121,7 @@ def carregar_dados(eng_param: Engine) -> tuple[pd.DataFrame | None, Exception | 
 # ==============================================================================
 # Estado da Sessão para Dialogs
 # ==============================================================================
-SUFFIX_DIALOG = "_dialog_datetime_fix" 
+SUFFIX_DIALOG = "_dialog_v_final_fix" 
 if f'show_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
     st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False
 if f'atividade_para_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
@@ -133,7 +139,6 @@ if f'atividades_para_comparacao{SUFFIX_DIALOG}' not in st.session_state:
 def mostrar_texto_completo_dialog():
     atividade_data = st.session_state[f'atividade_para_texto_dialog{SUFFIX_DIALOG}']
     if atividade_data:
-        # Verifica se 'activity_date' é um objeto datetime antes de formatar
         data_formatada = atividade_data['activity_date'].strftime('%d/%m/%Y %H:%M') if pd.notna(atividade_data['activity_date']) and isinstance(atividade_data['activity_date'], (datetime, pd.Timestamp)) else "Data Inválida"
         st.markdown(f"### Texto Completo - ID: `{atividade_data['activity_id']}`")
         st.markdown(f"**Pasta:** {atividade_data['activity_folder']} | **Data:** {data_formatada} | **Usuário:** {atividade_data['user_profile_name']} | **Status:** {atividade_data['activity_status']}")
@@ -141,7 +146,7 @@ def mostrar_texto_completo_dialog():
         if st.button("Fechar Texto", key=f"fechar_dialog_txt_btn{SUFFIX_DIALOG}"):
             st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False; st.rerun()
 
-@st.dialog("Comparação Detalhada de Textos", width="large")
+@st.dialog("Comparação Detalhada de Textos", width="large") # width="large" é uma sugestão
 def mostrar_comparacao_html_diff_dialog():
     atividades_comp_data = st.session_state[f'atividades_para_comparacao{SUFFIX_DIALOG}']
     if atividades_comp_data:
@@ -150,11 +155,14 @@ def mostrar_comparacao_html_diff_dialog():
         st.markdown(f"### Comparando ID `{base_comp['activity_id']}` com ID `{comparar_comp['activity_id']}`")
         texto_base_comp = str(base_comp['Texto'])
         texto_comparar_comp = str(comparar_comp['Texto'])
-        differ = difflib.HtmlDiff(wrapcolumn=65, linejunk=difflib.IS_LINE_JUNK, charjunk=difflib.IS_CHARACTER_JUNK) 
+        
+        # HtmlDiff para visualização rica das diferenças
+        differ = difflib.HtmlDiff(wrapcolumn=70) # Ajuste wrapcolumn para legibilidade
         html_comparison = differ.make_table(texto_base_comp.splitlines(), texto_comparar_comp.splitlines(),
-                                             fromdesc=f"ID: {base_comp['activity_id']}", 
-                                             todesc=f"ID: {comparar_comp['activity_id']}")
-        st.components.v1.html(html_comparison, height=550, scrolling=True)
+                                             fromdesc=f"Texto Atividade ID: {base_comp['activity_id']}", 
+                                             todesc=f"Texto Atividade ID: {comparar_comp['activity_id']}")
+        st.components.v1.html(html_comparison, height=600, scrolling=True) # Altura maior para mais conteúdo
+
         if st.button("Fechar Comparação", key=f"fechar_dialog_html_comp_btn{SUFFIX_DIALOG}"):
             st.session_state[f'show_comparacao_dialog{SUFFIX_DIALOG}'] = False; st.rerun()
 
@@ -170,7 +178,7 @@ def on_click_comparar_textos_html_dialog(atividade_base, atividade_comparar):
     st.session_state[f'show_comparacao_dialog{SUFFIX_DIALOG}'] = True
 
 # ==============================================================================
-# INTERFACE PRINCIPAL DO APP (RENOMEADA PARA app)
+# INTERFACE PRINCIPAL DO APP
 # ==============================================================================
 def app(): 
     st.sidebar.success(f"Logado como: **{st.session_state['username']}**")
@@ -187,39 +195,42 @@ def app():
     st.sidebar.header("⚙️ Filtros e Opções")
     
     if st.sidebar.button("🔄 Atualizar Dados Base", help="Busca os dados mais recentes.", key=f"buscar_btn_base{SUFFIX_DIALOG}"):
-        carregar_dados.clear(); st.toast("Buscando dados atualizados...", icon="🔄")
+        carregar_dados_base.clear(); st.toast("Buscando dados atualizados...", icon="🔄")
     
-    df_raw_total, erro_db = carregar_dados(eng) 
+    df_raw_total, erro_db = carregar_dados_base(eng) 
 
     if erro_db: st.error("Erro ao carregar dados."); st.exception(erro_db); st.stop()
     if df_raw_total is None or df_raw_total.empty: st.warning("Nenhuma atividade 'Verificar' retornada."); st.stop()
 
     st.sidebar.markdown("---"); st.sidebar.subheader("1. Filtro de Período (Exibição)")
-    hoje_ref = date.today() # Usar date.today()
+    hoje_data_atual = date.today() # Renomeado para clareza
     
-    # Garantir que activity_date é datetime antes de usar .dt
-    if 'activity_date' not in df_raw_total.columns or not pd.api.types.is_datetime64_any_dtype(df_raw_total['activity_date']):
-        st.error("Coluna 'activity_date' não está no formato datetime esperado após o carregamento.")
-        st.stop()
-        
-    data_inicio_padrao = hoje_ref - timedelta(days=1)
-    # Filtrar por NaT antes de aplicar .dt.date e depois .max()
-    datas_abertas_futuras_series = df_raw_total[
+    data_inicio_padrao_ui = hoje_data_atual - timedelta(days=1)
+    
+    # Para data_fim_padrao_ui, pegar a data mais futura das 'Abertas' ou X dias à frente
+    df_abertas_futuras = df_raw_total[
         (df_raw_total['activity_status'] == 'Aberta') & 
-        (df_raw_total['activity_date'].notna()) & # Checa se não é NaT
-        (df_raw_total['activity_date'].dt.date > hoje_ref)
-    ]['activity_date'].dt.date
+        (df_raw_total['activity_date'].notna()) & 
+        (df_raw_total['activity_date'].dt.date > hoje_data_atual)
+    ]
+    if not df_abertas_futuras.empty:
+        data_fim_padrao_ui = df_abertas_futuras['activity_date'].dt.date.max()
+    else:
+        data_fim_padrao_ui = hoje_data_atual + timedelta(days=14) 
     
-    data_fim_padrao = datas_abertas_futuras_series.max() if not datas_abertas_futuras_series.empty else hoje_ref + timedelta(days=14)
-    if data_inicio_padrao > data_fim_padrao: data_inicio_padrao = data_fim_padrao - timedelta(days=1)
+    # Garantir que data de início não seja após data de fim
+    if data_inicio_padrao_ui > data_fim_padrao_ui:
+        data_inicio_padrao_ui = data_fim_padrao_ui - timedelta(days=1) if data_fim_padrao_ui > hoje_data_atual else hoje_data_atual - timedelta(days=1)
 
-    data_inicio_selecionada = st.sidebar.date_input("Data de Início (Exibição)", value=data_inicio_padrao, key=f"di_exib{SUFFIX_DIALOG}")
-    data_fim_selecionada = st.sidebar.date_input("Data de Fim (Exibição)", value=data_fim_padrao, key=f"df_exib{SUFFIX_DIALOG}")
+
+    data_inicio_selecionada = st.sidebar.date_input("Data de Início (Exibição)", value=data_inicio_padrao_ui, key=f"di_exib{SUFFIX_DIALOG}")
+    data_fim_selecionada = st.sidebar.date_input("Data de Fim (Exibição)", value=data_fim_padrao_ui, min_value=data_inicio_selecionada, key=f"df_exib{SUFFIX_DIALOG}")
+
 
     if data_inicio_selecionada > data_fim_selecionada: st.sidebar.error("Data de início > data de fim."); st.stop()
     
     df_atividades_periodo_ui = df_raw_total[
-        (df_raw_total['activity_date'].notna()) & # Adicionado para segurança
+        (df_raw_total['activity_date'].notna()) & 
         (df_raw_total['activity_date'].dt.date >= data_inicio_selecionada) & 
         (df_raw_total['activity_date'].dt.date <= data_fim_selecionada)
     ]
@@ -229,13 +240,9 @@ def app():
     else: 
         st.success(f"**{len(df_atividades_periodo_ui)}** atividades no período de exibição (de {len(df_raw_total)} total carregado na base).")
     
-    # O restante do código continua aqui, usando df_atividades_periodo_ui como base para mais filtros e análise
-    # ... (filtros de análise, filtros de exibição final, análise de similaridade, exportação, exibição de resultados)
-    # (Cole o bloco de código da versão anterior que começa com "st.sidebar.markdown("---"); st.sidebar.subheader("2. Filtros de Análise")"
-    #  até antes da chamada aos dialogs no final da função app() )
-
-    # --- Filtros de Análise (sobre o período de exibição) ---
     st.sidebar.markdown("---"); st.sidebar.subheader("2. Filtros de Análise (sobre o período de exibição)")
+    # ... (Restante dos filtros de análise, cálculo de similaridade, filtros de exibição final, exportação e loop de renderização)
+    # O código abaixo é o mesmo da versão anterior, apenas garantindo que as referências a DataFrames estejam corretas.
     pastas_disp = sorted(df_atividades_periodo_ui['activity_folder'].dropna().unique()) if not df_atividades_periodo_ui.empty else []
     pastas_sel = st.sidebar.multiselect("Analisar Pasta(s):", pastas_disp, default=[], key=f"pasta_sel{SUFFIX_DIALOG}")
     status_disp_analise = sorted(df_atividades_periodo_ui['activity_status'].dropna().unique()) if not df_atividades_periodo_ui.empty else []
@@ -245,7 +252,6 @@ def app():
     if pastas_sel: df_para_analise = df_para_analise[df_para_analise['activity_folder'].isin(pastas_sel)]
     if status_sel_analise: df_para_analise = df_para_analise[df_para_analise['activity_status'].isin(status_sel_analise)]
     
-    # --- Filtros de Exibição Final ---
     st.sidebar.markdown("---"); st.sidebar.subheader("3. Filtros de Exibição Final")
     min_sim = st.sidebar.slider("Similaridade ≥ que (%):", 0, 100, 70, 5, key=f"sim_slider{SUFFIX_DIALOG}") / 100.0
     apenas_dup = st.sidebar.checkbox("Exibir apenas com duplicatas", value=True, key=f"dup_cb{SUFFIX_DIALOG}")
@@ -301,15 +307,16 @@ def app():
                     for id_base_export, lista_similares_export in map_id_para_similaridades.items():
                         if id_base_export in df_exibir['activity_id'].values: 
                             for sim_info_export in lista_similares_export:
-                                detalhes_similar_export_rows = df_raw_total[df_raw_total['activity_id'] == sim_info_export['id_similar']] # Usar df_raw_total para detalhes
+                                detalhes_similar_export_rows = df_raw_total[df_raw_total['activity_id'] == sim_info_export['id_similar']]
                                 if not detalhes_similar_export_rows.empty:
                                     detalhes_similar_export = detalhes_similar_export_rows.iloc[0]
+                                    data_dup_exp_str = detalhes_similar_export['activity_date'].strftime('%Y-%m-%d %H:%M') if pd.notna(detalhes_similar_export['activity_date']) else None
                                     lista_export_duplicatas.append({
                                         'ID_Base': id_base_export,
                                         'ID_Duplicata_Potencial': sim_info_export['id_similar'],
                                         'Percentual_Similaridade': sim_info_export['ratio'],
                                         'Cor_Similaridade': sim_info_export['cor'],
-                                        'Data_Duplicata': detalhes_similar_export['activity_date'].strftime('%Y-%m-%d %H:%M') if pd.notna(detalhes_similar_export['activity_date']) else None,
+                                        'Data_Duplicata': data_dup_exp_str,
                                         'Usuario_Duplicata': detalhes_similar_export['user_profile_name'],
                                         'Status_Duplicata': detalhes_similar_export['activity_status']
                                     })
@@ -322,48 +329,69 @@ def app():
     if df_exibir.empty: st.info("Nenhuma atividade para os filtros selecionados.")
     
     pastas_ordenadas = sorted(df_exibir['activity_folder'].unique()) if not df_exibir.empty else []
+    ITENS_POR_PAGINA = 20 # Definido para paginação
+    pagina_atual = st.session_state.get(f'pagina_atual{SUFFIX_DIALOG}', 0)
 
-    for nome_pasta in pastas_ordenadas:
-        df_pasta_exibicao = df_exibir[df_exibir['activity_folder'] == nome_pasta]
-        if df_pasta_exibicao.empty: continue
-        total_analisado_pasta = len(df_para_analise[df_para_analise['activity_folder'] == nome_pasta])
-        titulo = f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} exibidas / {total_analisado_pasta} analisadas)"
+    if pastas_ordenadas:
+        total_pastas_exibiveis = len(pastas_ordenadas)
+        total_paginas = (total_pastas_exibiveis + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA
+
+        if total_paginas > 1: # Só mostra paginação se houver mais de uma página
+            col_pag_1, col_pag_2, col_pag_3 = st.columns([1,2,1])
+            with col_pag_1:
+                if st.button("⬅️ Anterior", key=f"prev_page{SUFFIX_DIALOG}", disabled=(pagina_atual == 0)):
+                    st.session_state[f'pagina_atual{SUFFIX_DIALOG}'] -= 1; st.rerun()
+            with col_pag_3:
+                if st.button("Próxima ➡️", key=f"next_page{SUFFIX_DIALOG}", disabled=(pagina_atual >= total_paginas - 1)):
+                    st.session_state[f'pagina_atual{SUFFIX_DIALOG}'] += 1; st.rerun()
+            with col_pag_2:
+                st.markdown(f"<p style='text-align: center;'>Página {pagina_atual + 1} de {total_paginas}</p>", unsafe_allow_html=True)
         
-        with st.expander(titulo, expanded=len(df_pasta_exibicao) < 10):
-            for _, atividade_row in df_pasta_exibicao.iterrows():
-                atividade = atividade_row.to_dict()
-                st.markdown("---")
-                col_info, col_sim_display = st.columns([0.6, 0.4])
-                with col_info:
-                    data_atividade_str = atividade['activity_date'].strftime('%d/%m/%Y %H:%M') if pd.notna(atividade['activity_date']) else "Data Inválida"
-                    st.markdown(f"**ID:** `{atividade['activity_id']}` | **Data:** {data_atividade_str} | **Status:** `{atividade['activity_status']}`")
-                    st.markdown(f"**Usuário:** {atividade['user_profile_name']}")
-                    st.text_area("Texto:", str(atividade['Texto']), height=100, key=f"texto_exp{SUFFIX_DIALOG}_{nome_pasta}_{atividade['activity_id']}", disabled=True)
-                    btn_cols = st.columns(3)
-                    links = gerar_links_zflow(atividade['activity_id'])
-                    if btn_cols[0].button("👁️ Ver Completo", key=f"ver_completo_btn{SUFFIX_DIALOG}_{atividade['activity_id']}", on_click=on_click_ver_texto_completo, args=(atividade,)): pass
-                    btn_cols[1].link_button("🔗 ZFlow v1", links['antigo'])
-                    btn_cols[2].link_button("� ZFlow v2", links['novo'])
+        inicio_idx = pagina_atual * ITENS_POR_PAGINA
+        fim_idx = inicio_idx + ITENS_POR_PAGINA
+        pastas_para_pagina_atual = pastas_ordenadas[inicio_idx:fim_idx]
 
-                with col_sim_display:
-                    similares_para_esta_atividade = map_id_para_similaridades.get(atividade['activity_id'], [])
-                    if similares_para_esta_atividade:
-                        st.markdown(f"**<span style='color:red;'>Duplicatas (Intra-Pasta):</span>** ({len(similares_para_esta_atividade)})", unsafe_allow_html=True)
-                        for sim_data in similares_para_esta_atividade:
-                            info_dupe_rows = df_raw_total[df_raw_total['activity_id'] == sim_data['id_similar']] # Usar df_raw_total
-                            if not info_dupe_rows.empty:
-                                info_dupe = info_dupe_rows.iloc[0].to_dict()
-                                container_dup = st.container(border=True)
-                                data_dupe_str = info_dupe['activity_date'].strftime('%d/%m/%y %H:%M') if pd.notna(info_dupe['activity_date']) else "Data Inválida"
-                                container_dup.markdown(f"""<small><div style='background-color:{sim_data['cor']}; padding: 3px 6px; border-radius: 5px; color: black; margin-bottom: 5px; font-weight: 500;'>
-                                <b>ID: {info_dupe['activity_id']} ({sim_data['ratio']:.0%})</b><br>
-                                Data: {data_dupe_str} | Status: {info_dupe['activity_status']}<br>
-                                Usuário: {info_dupe['user_profile_name']}
-                                </div></small>""", unsafe_allow_html=True)
-                                if container_dup.button("⚖️ Comparar (Detalhado)", key=f"comp_html_dialog_btn{SUFFIX_DIALOG}_{atividade['activity_id']}_{info_dupe['activity_id']}", on_click=on_click_comparar_textos_html_dialog, args=(atividade, info_dupe)): pass
-                            else: st.caption(f"Detalhes da ID {sim_data['id_similar']} não disponíveis.")
-                    else:
-                        if not apenas_dup: st.markdown("**<span style='color:green;'>Sem duplicatas (nesta análise)</span>**", unsafe_allow_html=True)
+        for nome_pasta in pastas_para_pagina_atual:
+            df_pasta_exibicao = df_exibir[df_exibir['activity_folder'] == nome_pasta]
+            if df_pasta_exibicao.empty: continue
+            total_analisado_pasta = len(df_para_analise[df_para_analise['activity_folder'] == nome_pasta])
+            titulo = f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} exibidas / {total_analisado_pasta} analisadas)"
+            
+            with st.expander(titulo, expanded=len(df_pasta_exibicao) < 10):
+                for _, atividade_row in df_pasta_exibicao.iterrows():
+                    atividade = atividade_row.to_dict()
+                    st.markdown("---")
+                    col_info, col_sim_display = st.columns([0.6, 0.4])
+                    with col_info:
+                        data_at_str = atividade['activity_date'].strftime('%d/%m/%Y %H:%M') if pd.notna(atividade['activity_date']) else "Data Inválida"
+                        st.markdown(f"**ID:** `{atividade['activity_id']}` | **Data:** {data_at_str} | **Status:** `{atividade['activity_status']}`")
+                        st.markdown(f"**Usuário:** {atividade['user_profile_name']}")
+                        st.text_area("Texto:", str(atividade['Texto']), height=100, key=f"texto_exp{SUFFIX_DIALOG}_{nome_pasta}_{atividade['activity_id']}", disabled=True)
+                        btn_cols = st.columns(3)
+                        links = gerar_links_zflow(atividade['activity_id'])
+                        if btn_cols[0].button("👁️ Ver Completo", key=f"ver_completo_btn{SUFFIX_DIALOG}_{atividade['activity_id']}", on_click=on_click_ver_texto_completo, args=(atividade,)): pass
+                        btn_cols[1].link_button("🔗 ZFlow v1", links['antigo'])
+                        btn_cols[2].link_button("🔗 ZFlow v2", links['novo'])
+
+                    with col_sim_display:
+                        similares_para_esta_atividade = map_id_para_similaridades.get(atividade['activity_id'], [])
+                        if similares_para_esta_atividade:
+                            st.markdown(f"**<span style='color:red;'>Duplicatas (Intra-Pasta):</span>** ({len(similares_para_esta_atividade)})", unsafe_allow_html=True)
+                            for sim_data in similares_para_esta_atividade:
+                                info_dupe_rows = df_raw_total[df_raw_total['activity_id'] == sim_data['id_similar']]
+                                if not info_dupe_rows.empty:
+                                    info_dupe = info_dupe_rows.iloc[0].to_dict()
+                                    container_dup = st.container(border=True)
+                                    data_dupe_str_disp = info_dupe['activity_date'].strftime('%d/%m/%y %H:%M') if pd.notna(info_dupe['activity_date']) else "Data Inválida"
+                                    container_dup.markdown(f"""<small><div style='background-color:{sim_data['cor']}; padding: 3px 6px; border-radius: 5px; color: black; margin-bottom: 5px; font-weight: 500;'>
+                                    <b>ID: {info_dupe['activity_id']} ({sim_data['ratio']:.0%})</b><br>
+                                    Data: {data_dupe_str_disp} | Status: {info_dupe['activity_status']}<br>
+                                    Usuário: {info_dupe['user_profile_name']}
+                                    </div></small>""", unsafe_allow_html=True)
+                                    if container_dup.button("⚖️ Comparar (Detalhado)", key=f"comp_html_dialog_btn{SUFFIX_DIALOG}_{atividade['activity_id']}_{info_dupe['activity_id']}", on_click=on_click_comparar_textos_html_dialog, args=(atividade, info_dupe)): pass
+                                else: st.caption(f"Detalhes da ID {sim_data['id_similar']} não disponíveis.")
+                        else:
+                            if not apenas_dup: st.markdown("**<span style='color:green;'>Sem duplicatas (nesta análise)</span>**", unsafe_allow_html=True)
 
     if st.session_state.get(f'show_texto_dialog{SUFFIX_DIALOG}', False):
         mostrar_texto_completo_dialog()
@@ -395,8 +423,5 @@ def login_form():
 
 if __name__ == "__main__":
     if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
-    
-    if st.session_state["logged_in"]:
-        app() 
-    else:
-        login_form()
+    if st.session_state["logged_in"]: app() 
+    else: login_form()
