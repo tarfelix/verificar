@@ -12,7 +12,7 @@ import io
 st.set_page_config(layout="wide", page_title="Verificador Leve de Atividades")
 
 # ==============================================================================
-# FUNÇÕES DE LÓGICA E DADOS (AGORA USANDO ST.SECRETS)
+# FUNÇÕES DE LÓGICA E DADOS (USANDO ST.SECRETS)
 # ==============================================================================
 
 @st.cache_resource
@@ -25,7 +25,6 @@ def get_db_engine() -> Engine | None:
             f"@{db_creds['host']}/{db_creds['name']}"
         )
         engine_instance = create_engine(db_uri, pool_pre_ping=True, pool_recycle=3600)
-        # Testa a conexão para garantir que as credenciais funcionam
         with engine_instance.connect() as conn:
             conn.execute(text("SELECT 1"))
         return engine_instance
@@ -39,8 +38,7 @@ def get_db_engine() -> Engine | None:
 
 @st.cache_data(ttl=300, hash_funcs={Engine: lambda _: None})
 def buscar_atividades_leve(_engine: Engine, data_inicio: datetime.date, data_fim: datetime.date) -> pd.DataFrame:
-    """Busca atividades no banco de dados, sem o campo Texto e outros campos pesados."""
-    # A query continua a mesma
+    """Busca atividades no banco de dados."""
     query = text("""
         SELECT 
             activity_id, activity_folder, activity_subject, user_id, 
@@ -91,12 +89,10 @@ def check_login():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
 
-    # Se já logado, mostra o app principal e encerra a função aqui
     if st.session_state.logged_in:
         main_app()
         return
 
-    # Se não, mostra o formulário de login
     st.title("Login de Acesso")
     st.markdown("Por favor, insira suas credenciais para continuar.")
     
@@ -119,10 +115,8 @@ def main_app():
     engine = get_db_engine()
     
     if not engine:
-        # A mensagem de erro já é mostrada dentro de get_db_engine()
         st.stop()
 
-    # --- Barra Lateral ---
     st.sidebar.header("⚙️ Filtros")
     
     if st.sidebar.button("Logout"):
@@ -133,7 +127,6 @@ def main_app():
     data_inicio_filtro = st.sidebar.date_input("Data de Início", hoje - timedelta(days=1), key="data_inicio_leve")
     data_fim_filtro = st.sidebar.date_input("Data de Fim", hoje + timedelta(days=1), key="data_fim_leve")
 
-    # (O restante do código da interface principal continua exatamente o mesmo)
     if data_inicio_filtro > data_fim_filtro:
         st.sidebar.error("A data de início não pode ser posterior à data de fim.")
         st.stop()
@@ -150,13 +143,10 @@ def main_app():
     
     pastas_disponiveis = sorted(df_atividades_raw['activity_folder'].dropna().unique())
     pastas_selecionadas = st.sidebar.multiselect("Filtrar por Pasta(s):", pastas_disponiveis, default=[], key="pasta_filter_leve")
-
     status_disponiveis = sorted(df_atividades_raw['activity_status'].dropna().unique())
     status_selecionados = st.sidebar.multiselect("Filtrar por Status:", status_disponiveis, default=[], key="status_filter_leve")
-
     usuarios_disponiveis = sorted(df_atividades_raw['user_profile_name'].dropna().unique())
     usuarios_selecionados_exibicao = st.sidebar.multiselect("Filtrar por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_leve")
-    
     mostrar_apenas_pastas_com_recorrencia = st.sidebar.checkbox("Apenas pastas com >1 atividade", value=True, key="recorrencia_pasta_cb_leve")
     mostrar_apenas_pastas_multi_usuarios = st.sidebar.checkbox("Apenas pastas com múltiplos usuários", False, key="multiuser_pasta_cb_leve")
     
@@ -209,10 +199,14 @@ def main_app():
                 st.markdown(f"**Usuário:** {atividade['user_profile_name']}")
                 if 'activity_subject' in atividade and pd.notna(atividade['activity_subject']):
                     st.caption(f"Assunto: {atividade['activity_subject']}")
+                
                 link_cols = st.columns(2)
                 links = gerar_links_zflow(atividade['activity_id'])
-                link_cols[0].link_button("🔗 ZFlow v1", links['antigo'], key=f"v1_{atividade['activity_id']}")
-                link_cols[1].link_button("🔗 ZFlow v2", links['novo'], key=f"v2_{atividade['activity_id']}")
+                
+                # --- CORREÇÃO APLICADA AQUI ---
+                # Removido o argumento 'key' que estava causando o erro
+                link_cols[0].link_button("🔗 ZFlow v1", links['antigo'])
+                link_cols[1].link_button("🔗 ZFlow v2", links['novo'])
 
 # ==============================================================================
 # PONTO DE ENTRADA DA APLICAÇÃO
