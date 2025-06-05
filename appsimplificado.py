@@ -190,7 +190,7 @@ def main_app():
     for nome_pasta in nomes_pastas_ordenados:
         df_pasta_exibicao = pastas_agrupadas_exibicao.get_group(nome_pasta)
         multi_user_info = " (Múltiplos Usuários)" if nome_pasta in pastas_com_multi_usuarios_set else ""
-        with st.expander(f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} atividades){multi_user_info}", expanded=True):
+        with st.expander(f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} atividades){multi_user_info}", expanded=False):
             if nome_pasta in pastas_com_multi_usuarios_set:
                 st.caption(f"👥 Usuários: {', '.join(df_pasta_exibicao['user_profile_name'].unique())}")
             for _, atividade in df_pasta_exibicao.iterrows():
