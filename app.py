@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 from sqlalchemy import create_engine, text, exc
-from sqlalchemy.engine import Engine # Importar Engine para hash_funcs
+from sqlalchemy.engine import Engine
 from datetime import datetime, timedelta, date 
 from unidecode import unidecode
 from rapidfuzz import fuzz
@@ -12,7 +12,7 @@ import difflib
 # ==============================================================================
 # CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Cache Fix)")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Fix)")
 
 # ==============================================================================
 # FUNÇÕES AUXILIARES
@@ -66,15 +66,10 @@ def get_db_engine() -> Engine | None:
     except exc.SQLAlchemyError:
         return None 
 
-# CORREÇÃO PRINCIPAL APLICADA AQUI no decorador @st.cache_data
-@st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None}) 
-def carregar_dados(_engine_param: Engine, data_inicio_req: date, data_fim_req: date) -> tuple[pd.DataFrame | None, Exception | None]:
-    # O nome do parâmetro aqui é _engine_param para garantir que o underscore seja a primeira coisa
-    # e para diferenciá-lo da variável 'eng' ou 'engine' no escopo de chamada.
-    hoje_dt = date.today() 
+@st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None}) # Adicionado hash_funcs
+def carregar_dados(eng_param: Engine) -> tuple[pd.DataFrame | None, Exception | None]: # Renomeado engine para eng_param
+    hoje_dt = date.today()
     data_limite_historico = hoje_dt - timedelta(days=7)
-    
-    # Ajuste na query para buscar todas as abertas E o histórico dos últimos 7 dias
     query_abertas = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto, activity_type
         FROM ViewGrdAtividadesTarcisio WHERE activity_type = 'Verificar' AND activity_status = 'Aberta'
@@ -83,22 +78,22 @@ def carregar_dados(_engine_param: Engine, data_inicio_req: date, data_fim_req: d
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto, activity_type
         FROM ViewGrdAtividadesTarcisio WHERE activity_type = 'Verificar' AND DATE(activity_date) >= :data_limite
     """)
-    
-    # As datas passadas (data_inicio_req, data_fim_req) agora são usadas para filtrar o resultado combinado,
-    # e não diretamente nas queries de "todas abertas" ou "histórico 7 dias".
-    # A função buscará uma base maior e depois filtraremos por data na função app().
-
     try:
-        with _engine_param.connect() as connection: # Usar o parâmetro _engine_param
+        with eng_param.connect() as connection: # Usar eng_param
             df_abertas = pd.read_sql(query_abertas, connection)
             df_historico = pd.read_sql(query_historico, connection, params={"data_limite": data_limite_historico})
         
         df_combinado = pd.concat([df_abertas, df_historico], ignore_index=True)
-        df_combinado.sort_values(by=['activity_id', 'activity_status'], ascending=[True, True], inplace=True) 
-        df_final = df_combinado.drop_duplicates(subset=['activity_id'], keep='first')
-        df_final.sort_values(by=['activity_folder', 'activity_date', 'activity_id'], ascending=[True, False, False], inplace=True)
-        df_final['activity_date'] = pd.to_datetime(df_final['activity_date'])
-        df_final['Texto'] = df_final['Texto'].astype(str).fillna('')
+        
+        # Para evitar SettingWithCopyWarning, operar em cópias ou usar .loc
+        df_combinado_sorted = df_combinado.sort_values(by=['activity_id', 'activity_status'], ascending=[True, True])
+        df_final_temp = df_combinado_sorted.drop_duplicates(subset=['activity_id'], keep='first')
+        
+        # Criar uma cópia explícita para modificações
+        df_final = df_final_temp.sort_values(by=['activity_folder', 'activity_date', 'activity_id'], ascending=[True, False, False]).copy()
+        
+        df_final.loc[:, 'activity_date'] = pd.to_datetime(df_final['activity_date'])
+        df_final.loc[:, 'Texto'] = df_final['Texto'].astype(str).fillna('')
         return df_final, None
     except exc.SQLAlchemyError as e:
         return None, e
@@ -106,7 +101,7 @@ def carregar_dados(_engine_param: Engine, data_inicio_req: date, data_fim_req: d
 # ==============================================================================
 # Estado da Sessão para Dialogs
 # ==============================================================================
-SUFFIX_DIALOG = "_dialog_hash_fix" 
+SUFFIX_DIALOG = "_dialog_name_fix" 
 if f'show_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
     st.session_state[f'show_texto_dialog{SUFFIX_DIALOG}'] = False
 if f'atividade_para_texto_dialog{SUFFIX_DIALOG}' not in st.session_state:
@@ -161,69 +156,32 @@ def on_click_comparar_textos_html_dialog(atividade_base, atividade_comparar):
 # ==============================================================================
 # INTERFACE PRINCIPAL DO APP (RENOMEADA PARA app)
 # ==============================================================================
-def app(): # Renomeado de app_principal para app
+def app(): 
     st.sidebar.success(f"Logado como: **{st.session_state['username']}**")
-    if st.sidebar.button("Logout", key=f"logout_btn{SUFFIX_DIALOG}"): # Chave única
+    if st.sidebar.button("Logout", key=f"logout_btn{SUFFIX_DIALOG}"): 
         for key_state in list(st.session_state.keys()): del st.session_state[key_state]
         st.rerun()
 
     st.title("🔎 Verificador de Duplicidade (HtmlDiff no Dialog)")
     st.markdown("Análise de atividades 'Verificar' para identificar potenciais duplicidades.")
 
-    eng = get_db_engine() # Variável eng como no traceback
+    eng = get_db_engine() 
     if not eng: st.error("Falha crítica na conexão com o banco."); st.stop()
 
     st.sidebar.header("⚙️ Filtros e Opções")
     
-    # Botão para atualizar os dados (chama a função com as datas atuais da sidebar)
-    # As datas para a query inicial de carregar_dados são fixas (últimos 7 dias + abertas)
-    # O filtro de data na sidebar apenas filtra o DataFrame em memória.
+    if st.sidebar.button("🔄 Atualizar Dados Base", help="Busca os dados mais recentes.", key=f"buscar_btn_base{SUFFIX_DIALOG}"):
+        carregar_dados.clear(); st.toast("Buscando dados atualizados...", icon="🔄")
+        # O st.rerun() é implícito ao limpar o cache de uma função usada na execução atual.
     
-    if st.sidebar.button("🔄 Atualizar Dados Base", help="Busca os dados mais recentes (Abertas + Histórico 7 dias).", key=f"buscar_btn_base{SUFFIX_DIALOG}"):
-        # Para carregar_dados, não precisamos passar datas, pois a lógica de quais dados buscar está dentro dela.
-        # No entanto, o cache do Streamlit é baseado nos argumentos.
-        # Para forçar o recarregamento de carregar_dados, precisamos limpar seu cache.
-        # A função carregar_dados não usa data_inicio/fim como argumento para a query BASE.
-        # O _engine é o único argumento que influencia o cache de carregar_dados.
-        # A limpeza será feita pela mudança da "chave" de cache se for necessário,
-        # ou explicitamente se forçar um refresh para os mesmos parâmetros (o que não é o caso aqui).
-        carregar_dados.clear() # Limpa o cache de carregar_dados
-        st.toast("Buscando dados atualizados...", icon="🔄")
-        # st.rerun() # O Streamlit fará rerun ao limpar o cache de uma função usada
-
-    # A função carregar_dados não precisa mais das datas da sidebar para sua query interna,
-    # mas o cache do Streamlit ainda depende dos argumentos.
-    # Para simplificar e garantir que o cache funcione, vamos passar datas fixas simbólicas
-    # ou nenhuma, e deixar a lógica de datas dentro de carregar_dados.
-    # No entanto, a assinatura atual de carregar_dados espera datas.
-    # Vamos ajustar: carregar_dados não precisará mais de data_inicio_req e data_fim_req
-    # se sua lógica interna é fixa.
-    # --- AJUSTE ---
-    # A função carregar_dados agora não depende de data_inicio_req e data_fim_req para sua query principal.
-    # Esses parâmetros são removidos da chamada e da definição da função.
-    # O cache @st.cache_data(ttl=3600) só dependerá do _engine.
-    
-    # Versão anterior de carregar_dados (buscar_dados_do_banco) tinha data_inicio_req, data_fim_req
-    # A nova carregar_dados (ajustada para "Abertas + Histórico 7 dias") não precisaria delas.
-    # Vou manter a estrutura de passar datas para carregar_dados, mas a query interna é que define o escopo.
-    # Para o cache de `carregar_dados`, passaremos as datas que definem o "escopo máximo" que a função busca.
-    # Neste caso, é um pouco redundante já que a query é fixa, mas mantém a assinatura.
-    
-    hoje_ref = date.today()
-    data_inicio_carga_cache = hoje_ref - timedelta(days=7) # Limite inferior para o cache
-    data_fim_carga_cache = hoje_ref + timedelta(days=365) # Limite superior amplo para abertas futuras
-                                                       # Este é apenas para a chave do cache.
-                                                       # A query em si tem sua própria lógica de data.
-
-    df_raw_total, erro_db = carregar_dados(eng, data_inicio_carga_cache, data_fim_carga_cache)
-
+    # Chamada à função carregar_dados (sem argumentos de data, pois a lógica de data está dentro dela)
+    df_raw_total, erro_db = carregar_dados(eng) 
 
     if erro_db: st.error("Erro ao carregar dados."); st.exception(erro_db); st.stop()
     if df_raw_total is None or df_raw_total.empty: st.warning("Nenhuma atividade 'Verificar' retornada."); st.stop()
 
     st.sidebar.markdown("---"); st.sidebar.subheader("1. Filtro de Período (Exibição)")
-    
-    # Define as datas padrão para os seletores da sidebar com base nos dados carregados
+    hoje_ref = date.today()
     data_inicio_padrao = hoje_ref - timedelta(days=1)
     datas_abertas_futuras = df_raw_total[(df_raw_total['activity_status'] == 'Aberta') & (df_raw_total['activity_date'].dt.date > hoje_ref)]['activity_date'].dt.date
     data_fim_padrao = datas_abertas_futuras.max() if not datas_abertas_futuras.empty else hoje_ref + timedelta(days=14)
@@ -234,23 +192,24 @@ def app(): # Renomeado de app_principal para app
 
     if data_inicio_selecionada > data_fim_selecionada: st.sidebar.error("Data de início > data de fim."); st.stop()
     
-    # Filtro de data para exibição (opera sobre df_raw_total)
-    mask_data = (df_raw_total['activity_date'].dt.date >= data_inicio_selecionada) & (df_raw_total['activity_date'].dt.date <= data_fim_selecionada)
-    df_atividades_periodo_exibicao = df_raw_total[mask_data] # Este é o DataFrame para exibir e analisar
+    # Esta variável agora contém os dados do período selecionado na UI, extraídos de df_raw_total
+    df_atividades_periodo_ui = df_raw_total[ # Renomeado para clareza
+        (df_raw_total['activity_date'].dt.date >= data_inicio_selecionada) & 
+        (df_raw_total['activity_date'].dt.date <= data_fim_selecionada)
+    ]
 
-    if df_atividades_periodo_exibicao.empty: 
+    if df_atividades_periodo_ui.empty: 
         st.info(f"Nenhuma atividade para o período de exibição de {data_inicio_selecionada.strftime('%d/%m/%Y')} a {data_fim_selecionada.strftime('%d/%m/%Y')}.")
     else: 
-        st.success(f"**{len(df_atividades_periodo_exibicao)}** atividades no período de exibição (de {len(df_raw_total)} total carregado na base).")
+        st.success(f"**{len(df_atividades_periodo_ui)}** atividades no período de exibição (de {len(df_raw_total)} total carregado na base).")
     
-    # Filtros de Análise e Exibição operam sobre df_atividades_periodo_exibicao
     st.sidebar.markdown("---"); st.sidebar.subheader("2. Filtros de Análise (sobre o período de exibição)")
-    pastas_disp = sorted(df_atividades_periodo_exibicao['activity_folder'].dropna().unique()) if not df_atividades_periodo_exibicao.empty else []
+    pastas_disp = sorted(df_atividades_periodo_ui['activity_folder'].dropna().unique()) if not df_atividades_periodo_ui.empty else []
     pastas_sel = st.sidebar.multiselect("Analisar Pasta(s):", pastas_disp, default=[], key=f"pasta_sel{SUFFIX_DIALOG}")
-    status_disp_analise = sorted(df_atividades_periodo_exibicao['activity_status'].dropna().unique()) if not df_atividades_periodo_exibicao.empty else []
+    status_disp_analise = sorted(df_atividades_periodo_ui['activity_status'].dropna().unique()) if not df_atividades_periodo_ui.empty else []
     status_sel_analise = st.sidebar.multiselect("Analisar Status:", status_disp_analise, default=[], key=f"status_sel{SUFFIX_DIALOG}")
 
-    df_para_analise = df_atividades_periodo_exibicao.copy()
+    df_para_analise = df_atividades_periodo_ui.copy() # Análise é feita sobre o que foi filtrado por data na UI
     if pastas_sel: df_para_analise = df_para_analise[df_para_analise['activity_folder'].isin(pastas_sel)]
     if status_sel_analise: df_para_analise = df_para_analise[df_para_analise['activity_status'].isin(status_sel_analise)]
     
@@ -263,12 +222,11 @@ def app(): # Renomeado de app_principal para app
     usuarios_sel = st.sidebar.multiselect("Exibir Usuário(s):", usuarios_disp_ex, default=[], key=f"user_sel{SUFFIX_DIALOG}")
 
     ids_com_duplicatas = set()
-    map_id_para_similaridades = {} # Usar map para melhor organização
+    map_id_para_similaridades = {} 
 
     if not df_para_analise.empty and len(df_para_analise) > 1:
         prog_placeholder = st.sidebar.empty(); prog_bar = st.sidebar.progress(0)
         total_pastas_analise = df_para_analise['activity_folder'].nunique(); pastas_processadas_analise = 0
-        
         for nome_pasta_calc, df_pasta_calc in df_para_analise.groupby('activity_folder'):
             prog_placeholder.text(f"Analisando Pasta: {nome_pasta_calc}...")
             if len(df_pasta_calc) < 2:
@@ -294,7 +252,7 @@ def app(): # Renomeado de app_principal para app
         for act_id_sort_map in map_id_para_similaridades:
             map_id_para_similaridades[act_id_sort_map] = sorted(map_id_para_similaridades[act_id_sort_map], key=lambda x: x['ratio'], reverse=True)
 
-    df_exibir = df_para_analise.copy() # Começa com os dados filtrados por pasta/status de análise
+    df_exibir = df_para_analise.copy()
     if apenas_dup: df_exibir = df_exibir[df_exibir['activity_id'].isin(ids_com_duplicatas)]
     if apenas_multi: df_exibir = df_exibir[df_exibir['activity_folder'].isin(pastas_multi_user)]
     if usuarios_sel: df_exibir = df_exibir[df_exibir['user_profile_name'].isin(usuarios_sel)]
@@ -302,7 +260,6 @@ def app(): # Renomeado de app_principal para app
     st.sidebar.markdown("---")
     if st.sidebar.button("📥 Exportar para XLSX", key=f"export_btn{SUFFIX_DIALOG}"):
         if not df_exibir.empty:
-            # ... (Lógica de exportação como antes, usando df_exibir e map_id_para_similaridades) ...
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_exibir.to_excel(writer, index=False, sheet_name='Atividades_Exibidas')
@@ -311,14 +268,15 @@ def app(): # Renomeado de app_principal para app
                     for id_base_export, lista_similares_export in map_id_para_similaridades.items():
                         if id_base_export in df_exibir['activity_id'].values: 
                             for sim_info_export in lista_similares_export:
-                                detalhes_similar_export_rows = df_atividades_periodo[df_atividades_periodo['activity_id'] == sim_info_export['id_similar']]
+                                # Usar df_raw_total para buscar detalhes da duplicata, pois garante que a atividade exista
+                                detalhes_similar_export_rows = df_raw_total[df_raw_total['activity_id'] == sim_info_export['id_similar']]
                                 if not detalhes_similar_export_rows.empty:
                                     detalhes_similar_export = detalhes_similar_export_rows.iloc[0]
                                     lista_export_duplicatas.append({
                                         'ID_Base': id_base_export,
                                         'ID_Duplicata_Potencial': sim_info_export['id_similar'],
                                         'Percentual_Similaridade': sim_info_export['ratio'],
-                                        'Cor_Similaridade': sim_info_export['cor'], # Adicionado
+                                        'Cor_Similaridade': sim_info_export['cor'],
                                         'Data_Duplicata': detalhes_similar_export['activity_date'].strftime('%Y-%m-%d %H:%M'),
                                         'Usuario_Duplicata': detalhes_similar_export['user_profile_name'],
                                         'Status_Duplicata': detalhes_similar_export['activity_status']
@@ -327,7 +285,6 @@ def app(): # Renomeado de app_principal para app
                         pd.DataFrame(lista_export_duplicatas).to_excel(writer, index=False, sheet_name='Detalhes_Duplicatas')
             st.sidebar.download_button("Baixar XLSX", output.getvalue(), f"duplicatas_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else: st.sidebar.warning("Nenhum dado para exportar.")
-
 
     st.header("Análise Detalhada por Pasta")
     if df_exibir.empty: st.info("Nenhuma atividade para os filtros selecionados.")
@@ -340,7 +297,7 @@ def app(): # Renomeado de app_principal para app
         total_analisado_pasta = len(df_para_analise[df_para_analise['activity_folder'] == nome_pasta])
         titulo = f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} exibidas / {total_analisado_pasta} analisadas)"
         
-        with st.expander(titulo, expanded=len(df_pasta_exibicao) < 10): # Expandir se poucas atividades
+        with st.expander(titulo, expanded=len(df_pasta_exibicao) < 10):
             for _, atividade_row in df_pasta_exibicao.iterrows():
                 atividade = atividade_row.to_dict()
                 st.markdown("---")
@@ -360,8 +317,8 @@ def app(): # Renomeado de app_principal para app
                     if similares_para_esta_atividade:
                         st.markdown(f"**<span style='color:red;'>Duplicatas (Intra-Pasta):</span>** ({len(similares_para_esta_atividade)})", unsafe_allow_html=True)
                         for sim_data in similares_para_esta_atividade:
-                            # Usar df_atividades_periodo para buscar detalhes, pois contém todos os dados do período carregado para a UI
-                            info_dupe_rows = df_atividades_periodo[df_atividades_periodo['activity_id'] == sim_data['id_similar']]
+                            # Usar df_raw_total para buscar detalhes da duplicata, pois garante que a atividade exista
+                            info_dupe_rows = df_raw_total[df_raw_total['activity_id'] == sim_data['id_similar']]
                             if not info_dupe_rows.empty:
                                 info_dupe = info_dupe_rows.iloc[0].to_dict()
                                 container_dup = st.container(border=True)
@@ -404,11 +361,9 @@ def login_form():
     st.info("Use as credenciais do secrets.toml.")
 
 if __name__ == "__main__":
-    # Renomeado de app_principal para app, conforme traceback do usuário
-    # A lógica de login será chamada primeiro
     if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
     
     if st.session_state["logged_in"]:
-        app() # Chamando a função principal do app renomeada
+        app() 
     else:
         login_form()
