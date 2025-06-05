@@ -66,7 +66,6 @@ def get_db_engine() -> Engine | None:
         with engine.connect(): pass
         return engine
     except exc.SQLAlchemyError:
-        # O erro específico já será tratado na função main ao tentar usar a engine
         return None 
 
 @st.cache_data(ttl=7200)
@@ -102,14 +101,13 @@ def carregar_dados_iniciais(_engine: Engine) -> tuple[pd.DataFrame | None, Excep
 def check_credentials(username, password):
     """Verifica as credenciais contra o secrets.toml."""
     try:
-        # Acessa o dicionário de usernames diretamente
         user_credentials = st.secrets["credentials"]["usernames"]
-        if username in user_credentials and user_credentials[username] == password:
+        if username in user_credentials and str(user_credentials[username]) == password: # Garantir que a senha seja string
             return True
     except KeyError:
         st.error("Seção 'credentials.usernames' não encontrada ou mal formatada no secrets.toml.")
         return False
-    except Exception as e: # Captura outros possíveis erros ao acessar secrets
+    except Exception as e:
         st.error(f"Erro ao ler credenciais de login: {e}")
         return False
     return False
@@ -119,7 +117,8 @@ def login_form():
     st.header("Login - Verificador de Duplicidade")
     with st.form("login_form"):
         username = st.text_input("Usuário", key="login_username")
-        password = st.password_input("Senha", key="login_password")
+        # --- CORREÇÃO APLICADA AQUI ---
+        password = st.text_input("Senha", key="login_password", type="password") 
         submitted = st.form_submit_button("Entrar")
 
         if submitted:
@@ -127,11 +126,10 @@ def login_form():
                 st.session_state["logged_in"] = True
                 st.session_state["username"] = username
                 st.success(f"Login bem-sucedido como {username}!")
-                st.rerun() # Força o rerun para mostrar o app principal
+                st.rerun()
             else:
                 st.error("Usuário ou senha inválidos.")
     st.info("As credenciais de login e banco de dados são gerenciadas através do arquivo secrets.toml.")
-
 
 # ==============================================================================
 # INTERFACE PRINCIPAL DO APP (APÓS LOGIN)
@@ -139,7 +137,7 @@ def login_form():
 def app_principal():
     st.sidebar.success(f"Logado como: **{st.session_state['username']}**")
     if st.sidebar.button("Logout", key="logout_button"):
-        for key in list(st.session_state.keys()): # Limpa todo o session_state ao fazer logout
+        for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
 
@@ -148,7 +146,7 @@ def app_principal():
 
     engine = get_db_engine()
     if not engine:
-        st.error("Falha crítica na conexão com o banco de dados. Verifique as configurações em secrets.toml e o status do servidor.")
+        st.error("Falha crítica na conexão com o banco. Verifique as configurações em secrets.toml e o status do servidor.")
         st.stop()
 
     st.sidebar.header("⚙️ Filtros e Opções")
@@ -173,15 +171,14 @@ def app_principal():
     min_data_disp = df_raw_total['activity_date'].dt.date.min() if not df_raw_total.empty else datetime.today().date() - timedelta(days=7)
     max_data_disp = df_raw_total['activity_date'].dt.date.max() if not df_raw_total.empty else datetime.today().date()
 
-    data_inicio_filtro = st.sidebar.date_input("Data de Início", value=min_data_disp, min_value=min_data_disp, max_value=max_data_disp, key="di_login")
-    data_fim_filtro = st.sidebar.date_input("Data de Fim", value=max_data_disp, min_value=min_data_disp, max_value=max_data_disp, key="df_login")
+    data_inicio_filtro = st.sidebar.date_input("Data de Início", value=min_data_disp, min_value=min_data_disp, max_value=max_data_disp, key="di_login_fix")
+    data_fim_filtro = st.sidebar.date_input("Data de Fim", value=max_data_disp, min_value=min_data_disp, max_value=max_data_disp, key="df_login_fix")
 
     if data_inicio_filtro > data_fim_filtro:
         st.sidebar.error("Data de início > data de fim.")
         st.stop()
     
-    mask_data = (df_raw_total['activity_date'].dt.date >= data_inicio_filtro) & \
-                (df_raw_total['activity_date'].dt.date <= data_fim_filtro)
+    mask_data = (df_raw_total['activity_date'].dt.date >= data_inicio_filtro) & (df_raw_total['activity_date'].dt.date <= data_fim_filtro)
     df_atividades_periodo = df_raw_total[mask_data]
 
     if df_atividades_periodo.empty:
@@ -203,14 +200,14 @@ def app_principal():
     
     st.sidebar.markdown("---")
     st.sidebar.subheader("3. Filtros de Exibição")
-    min_sim = st.sidebar.slider("Similaridade ≥ que (%):", 0, 100, 70, 5, key="sim_login") / 100.0
-    apenas_dup = st.sidebar.checkbox("Exibir apenas com duplicatas", value=True, key="dup_login")
+    min_sim = st.sidebar.slider("Similaridade ≥ que (%):", 0, 100, 70, 5, key="sim_login_fix") / 100.0
+    apenas_dup = st.sidebar.checkbox("Exibir apenas com duplicatas", value=True, key="dup_login_fix")
     
     pastas_multi_user = {nome for nome, grupo in df_para_analise.groupby('activity_folder') if grupo['user_profile_name'].nunique() > 1} if not df_para_analise.empty else set()
-    apenas_multi = st.sidebar.checkbox("Exibir pastas com múltiplos usuários", False, key="multi_login")
+    apenas_multi = st.sidebar.checkbox("Exibir pastas com múltiplos usuários", False, key="multi_login_fix")
 
     usuarios_disp_ex = sorted(df_para_analise['user_profile_name'].dropna().unique()) if not df_para_analise.empty else []
-    usuarios_sel = st.sidebar.multiselect("Exibir Usuário(s):", usuarios_disp_ex, default=[], key="user_login")
+    usuarios_sel = st.sidebar.multiselect("Exibir Usuário(s):", usuarios_disp_ex, default=[], key="user_login_fix")
 
     ids_com_duplicatas = set()
     todas_similaridades = []
@@ -237,7 +234,7 @@ def app_principal():
     if usuarios_sel: df_exibir = df_exibir[df_exibir['user_profile_name'].isin(usuarios_sel)]
 
     st.sidebar.markdown("---")
-    if st.sidebar.button("📥 Exportar para XLSX", key="export_login"):
+    if st.sidebar.button("📥 Exportar para XLSX", key="export_login_fix"):
         if not df_exibir.empty:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -292,11 +289,11 @@ def app_principal():
                             else: st.caption(f"Detalhes da ID {sim_data['id_similar']} não disponíveis.")
                     else:
                         if not apenas_dup: st.markdown("**<span style='color:green;'>Sem duplicatas</span>**", unsafe_allow_html=True)
+
 # ==============================================================================
 # PONTO DE ENTRADA PRINCIPAL
 # ==============================================================================
 if __name__ == "__main__":
-    # Gerenciamento do estado de login
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
 
