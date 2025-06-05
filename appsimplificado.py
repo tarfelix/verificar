@@ -24,6 +24,7 @@ def gerar_links_zflow(activity_id: int) -> dict:
 @st.cache_resource
 def get_db_engine() -> Engine | None:
     """Cria e retorna uma engine de conexão com o banco."""
+    # IMPORTANTE: Em um ambiente de produção, use st.secrets para gerenciar credenciais.
     db_user, db_pass, db_host, db_name = "tarcisio", "123qwe", "40.88.40.110", "zion_flow"
     if not all([db_user, db_pass, db_host, db_name]):
         st.error("Credenciais do banco de dados não definidas completamente no código.")
@@ -39,22 +40,19 @@ def get_db_engine() -> Engine | None:
         st.exception(e) # Mostra o erro completo para debug
         return None
 
-@st.cache_data(ttl=300, hash_funcs={Engine: lambda _: None}) # TTL reduzido para atualizações mais rápidas se necessário
+@st.cache_data(ttl=300, hash_funcs={Engine: lambda _: None})
 def buscar_atividades_leve(_engine: Engine, data_inicio: datetime.date, data_fim: datetime.date) -> pd.DataFrame:
     """Busca atividades no banco de dados, sem o campo Texto e outros campos pesados."""
-    # Query otimizada para não buscar campos de texto longos
     query = text("""
         SELECT 
             activity_id, 
             activity_folder, 
-            activity_subject,  -- Mantido para identificação básica
+            activity_subject, 
             user_id, 
             user_profile_name,
             activity_date, 
             activity_status, 
             activity_type
-            -- Removidos: Texto, observacoes, tags, activity_publish_date, activity_fatal, activity_created_at, activity_updated_at
-            -- para tornar a query mais leve. Adicione de volta se necessário.
         FROM ViewGrdAtividadesTarcisio
         WHERE activity_type = :tipo_atividade
           AND DATE(activity_date) BETWEEN :data_inicio AND :data_fim
@@ -68,7 +66,6 @@ def buscar_atividades_leve(_engine: Engine, data_inicio: datetime.date, data_fim
                 "data_fim": data_fim
             })
         if 'activity_date' in df.columns:
-            # Converte para objeto de data, removendo informações de tempo se houver
             df['activity_date'] = pd.to_datetime(df['activity_date']).dt.normalize()
         return df
     except exc.SQLAlchemyError as e:
@@ -86,8 +83,12 @@ def main():
     st.markdown("Identifique rapidamente pastas com múltiplas atividades 'Verificar'.")
 
     engine = get_db_engine()
+    
+    # --- AJUSTE 1: Tratamento de erro de conexão ---
     if not engine:
-        st.stop() # Interrompe a execução se não houver conexão com o banco
+        st.error("A conexão com o banco de dados não pôde ser estabelecida.")
+        st.info("Verifique as credenciais no código e o status do servidor do banco de dados.")
+        st.stop() # Interrompe a execução se não houver conexão
 
     # --- Filtros na Sidebar ---
     st.sidebar.header("⚙️ Filtros")
@@ -111,21 +112,17 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filtros Adicionais:")
     
-    # Filtro por Pasta
     pastas_disponiveis = sorted(df_atividades_raw['activity_folder'].dropna().unique())
     pastas_selecionadas = st.sidebar.multiselect("Filtrar por Pasta(s):", pastas_disponiveis, default=[], key="pasta_filter_leve")
 
-    # Filtro por Status
     status_disponiveis = sorted(df_atividades_raw['activity_status'].dropna().unique())
     status_selecionados = st.sidebar.multiselect("Filtrar por Status:", status_disponiveis, default=[], key="status_filter_leve")
 
-    # Filtro por Usuário (para exibição)
     usuarios_disponiveis = sorted(df_atividades_raw['user_profile_name'].dropna().unique())
     usuarios_selecionados_exibicao = st.sidebar.multiselect(
         "Filtrar por Usuário(s):", usuarios_disponiveis, default=[], key="user_filter_leve"
     )
     
-    # Checkbox para mostrar apenas pastas com múltiplas atividades ou múltiplos usuários
     mostrar_apenas_pastas_com_recorrencia = st.sidebar.checkbox(
         "Mostrar apenas pastas com >1 atividade", 
         value=True, 
@@ -164,29 +161,27 @@ def main():
     if mostrar_apenas_pastas_multi_usuarios:
         df_filtrado = df_filtrado[df_filtrado['activity_folder'].isin(pastas_com_multi_usuarios_set)]
 
-
-    # --- Botão de Exportação ---
+    # --- AJUSTE 2: Botão de Exportação Melhorado ---
     st.sidebar.markdown("---")
-    if st.sidebar.button("📥 Exportar Dados Exibidos para XLSX", key="export_xlsx_btn_leve"):
-        if not df_filtrado.empty:
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Selecionar colunas para exportação (sem 'Texto')
-                colunas_export = ['activity_id', 'activity_folder', 'activity_subject', 'user_profile_name', 'activity_date', 'activity_status']
-                df_export = df_filtrado[colunas_export].copy()
-                df_export.to_excel(writer, index=False, sheet_name='Atividades_Verificar_Leve')
-            
-            st.sidebar.download_button(
-                label="Baixar XLSX",
-                data=output.getvalue(),
-                file_name=f"atividades_verificar_leve_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.sidebar.warning("Nenhum dado para exportar com os filtros atuais.")
+    if not df_filtrado.empty:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            colunas_export = ['activity_id', 'activity_folder', 'activity_subject', 'user_profile_name', 'activity_date', 'activity_status']
+            df_export = df_filtrado[colunas_export].copy()
+            df_export.to_excel(writer, index=False, sheet_name='Atividades_Verificar_Leve')
+        
+        st.sidebar.download_button(
+            label="📥 Baixar Dados Exibidos (XLSX)",
+            data=output.getvalue(),
+            file_name=f"atividades_verificar_leve_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_xlsx_btn_leve"
+        )
+    else:
+        st.sidebar.warning("Nenhum dado para exportar com os filtros atuais.")
 
     # --- Ordenação de Pastas ---
-    ordem_pastas_opcao = st.sidebar.selectbox( # Renomeado para evitar conflito com variável
+    ordem_pastas_opcao = st.sidebar.selectbox(
         "Ordenar pastas por:",
         ("Nome da Pasta (A-Z)", "Mais Atividades Primeiro"),
         key="ordem_pastas_leve"
@@ -209,36 +204,29 @@ def main():
     else: # Fallback
         nomes_pastas_ordenados = sorted(pastas_agrupadas_exibicao.groups.keys())
 
-
     for nome_pasta in nomes_pastas_ordenados:
-        df_pasta_exibicao = pastas_agrupadas_exibicao.get_group(nome_pasta) # Usar get_group para obter o DataFrame da pasta
+        df_pasta_exibicao = pastas_agrupadas_exibicao.get_group(nome_pasta)
         
-        # Info se a pasta (já filtrada) tem múltiplos usuários
         multi_user_info = " (Múltiplos Usuários nesta pasta)" if nome_pasta in pastas_com_multi_usuarios_set else ""
 
         with st.expander(f"📁 Pasta: {nome_pasta} ({len(df_pasta_exibicao)} atividades){multi_user_info}", expanded=True):
             if nome_pasta in pastas_com_multi_usuarios_set:
-                 usuarios_na_pasta = df_pasta_exibicao['user_profile_name'].unique()
-                 st.caption(f"👥 Usuários: {', '.join(usuarios_na_pasta)}")
+                usuarios_na_pasta = df_pasta_exibicao['user_profile_name'].unique()
+                st.caption(f"👥 Usuários: {', '.join(usuarios_na_pasta)}")
 
             for _, atividade in df_pasta_exibicao.iterrows():
                 activity_id = atividade['activity_id']
                 links = gerar_links_zflow(activity_id)
                 st.markdown("---")
                 
-                # Exibição simplificada sem a coluna de duplicatas
                 st.markdown(f"**ID:** `{activity_id}` | **Data:** {atividade['activity_date'].strftime('%d/%m/%Y')} | **Status:** `{atividade['activity_status']}`")
                 st.markdown(f"**Usuário:** {atividade['user_profile_name']}")
                 if 'activity_subject' in atividade and pd.notna(atividade['activity_subject']):
-                    st.caption(f"Assunto: {atividade['activity_subject']}") # Mostrar assunto se disponível
+                    st.caption(f"Assunto: {atividade['activity_subject']}")
 
-                # Botões de link para ZFlow
                 link_cols = st.columns(2)
                 link_cols[0].link_button("🔗 ZFlow v1", links['antigo'], help="Abrir no ZFlow (versão antiga)")
                 link_cols[1].link_button("🔗 ZFlow v2", links['novo'], help="Abrir no ZFlow (versão nova)")
-else:
-    st.error("A conexão com o banco de dados não pôde ser estabelecida.")
-    st.info("Verifique as credenciais no código e o status do servidor do banco de dados.")
 
 if __name__ == "__main__":
     main()
