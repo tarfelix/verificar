@@ -2,4 +2,6 @@ streamlit
 pandas
 sqlalchemy
 mysql-connector-python
+unidecode
+rapidfuzz
 openpyxl
