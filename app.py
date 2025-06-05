@@ -400,4 +400,3 @@ if __name__ == "__main__":
         app() 
     else:
         login_form()
-�
