@@ -1,327 +1,337 @@
 import streamlit as st
 import pandas as pd
-import re, io, html, os
-from datetime import datetime, timedelta, date
+import re
 from sqlalchemy import create_engine, text, exc
 from sqlalchemy.engine import Engine
+from datetime import datetime, timedelta, date
 from unidecode import unidecode
 from rapidfuzz import fuzz
+import io
+import html
+import os
 
-# ═════════ CONFIGURAÇÃO GERAL ════════════════════════════════════════════════
-SUFFIX_STATE      = "_final_fix"
-ITENS_POR_PAGINA  = 20
-HIGHLIGHT_COLOR   = "#a8d1ff"
+# ==============================================================================
+# CONFIGURAÇÕES
+# ==============================================================================
+SUFFIX_STATE = "_final_v3" # Sufixo atualizado para esta versão
+ITENS_POR_PAGINA = 20
+HIGHLIGHT_COLOR = "#a8d1ff" # Azul claro para destacar semelhanças
 
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Refinado)")
 
-st.markdown(f"""
-<style>
- mark.common {{background:{HIGHLIGHT_COLOR};padding:0 2px;font-weight:bold}}
- pre.highlighted-text {{
-   white-space:pre-wrap;word-wrap:break-word;
-   font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,Courier,monospace;
-   font-size:.9em;padding:10px;border:1px solid #ddd;border-radius:5px;background:#f9f9f9;
- }}
- .similarity-badge {{padding:3px 6px;border-radius:5px;color:black;font-weight:500;display:inline-block}}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <style>
+    mark.common {{ background-color:{HIGHLIGHT_COLOR}; padding:0 2px; font-weight: bold;}}
+    pre.highlighted-text {{ 
+        white-space: pre-wrap; 
+        word-wrap: break-word; 
+        font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+        font-size: 0.9em;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        background-color: #f9f9f9;
+    }}
+    .similarity-badge {{
+        padding: 3px 6px; 
+        border-radius: 5px; 
+        color: black; 
+        margin-bottom: 5px; 
+        font-weight: 500;
+        display: inline-block;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ═════════ FUNÇÕES DE TEXTO & SIMILARIDADE ═══════════════════════════════════
+# ==============================================================================
+# FUNÇÕES AUXILIARES
+# ==============================================================================
 def normalizar_texto(txt: str | None) -> str:
-    """Remove acentos, pontuação e múltiplos espaços, retornando lower-case."""
-    if not txt or not isinstance(txt, str):
-        return ""
+    if not txt or not isinstance(txt, str): return ""
     txt = unidecode(txt.lower())
     txt = re.sub(r"[^\w\s]", " ", txt)
     return re.sub(r"\s+", " ", txt).strip()
 
-def calcular_similaridade(txt_a: str, txt_b: str) -> float:
-    """Token-set ratio (RapidFuzz) entre textos já normalizados."""
-    a, b = normalizar_texto(txt_a), normalizar_texto(txt_b)
-    if not a or not b:
-        return 0.0
-    # evita comparar blocos com tamanhos muito díspares
-    if abs(len(a) - len(b)) > 0.5 * max(len(a), len(b)):
-        return 0.0
+def calcular_similaridade(a: str, b: str) -> float:
+    a, b = normalizar_texto(a), normalizar_texto(b)
+    if not a or not b: return 0.0
+    if abs(len(a) - len(b)) > 0.3 * max(len(a), len(b)): return 0.0
     return fuzz.token_set_ratio(a, b) / 100
 
 def cor_sim(ratio: float) -> str:
-    """Define cor do badge conforme similaridade."""
     return "#FF5252" if ratio >= .9 else "#FFB74D" if ratio >= .7 else "#FFD54F"
 
-def highlight_common(texto1: str, texto2: str, min_len: int = 3) -> tuple[str, str]:
-    """
-    Devolve HTML de dois textos com palavras em comum destacadas
-    usando <mark class="common">.
-    """
-    tokens1 = re.findall(r"\w+", normalizar_texto(texto1))
-    tokens2 = re.findall(r"\w+", normalizar_texto(texto2))
-    comuns  = {w for w in tokens1 if w in tokens2 and len(w) >= min_len}
+def highlight_common(t1: str, t2: str, min_len: int = 3) -> tuple[str, str]:
+    tok1 = re.findall(r'\w+', normalizar_texto(t1))
+    tok2 = re.findall(r'\w+', normalizar_texto(t2))
+    comuns = {w for w in tok1 if w in tok2 and len(w) >= min_len}
 
-    def wrap(original: str) -> str:
-        parts, out = re.split(r"(\W+)", original), []
+    def wrap(txt):
+        parts = re.split(r"(\W+)", txt) # Divide mantendo delimitadores
+        out = []
         for part in parts:
-            if not part:
-                continue
+            if not part: continue
+            # Destaca apenas se a parte for uma palavra e sua versão normalizada estiver em 'comuns'
             if re.match(r"\w+", part) and normalizar_texto(part) in comuns:
                 out.append(f"<mark class='common'>{html.escape(part)}</mark>")
             else:
                 out.append(html.escape(part))
         return "<pre class='highlighted-text'>" + "".join(out) + "</pre>"
+    return wrap(t1), wrap(t2)
 
-    return wrap(texto1), wrap(texto2)
-
-# ═════════ BANCO DE DADOS (MySQL) ════════════════════════════════════════════
 @st.cache_resource
 def db_engine() -> Engine | None:
-    """Cria engine MySQL usando credenciais em st.secrets ou variáveis de ambiente."""
-    host = st.secrets.get("database", {}).get("host") or os.getenv("DB_HOST")
-    user = st.secrets.get("database", {}).get("user") or os.getenv("DB_USER")
-    pw   = st.secrets.get("database", {}).get("password") or os.getenv("DB_PASS")
-    db   = st.secrets.get("database", {}).get("name") or os.getenv("DB_NAME")
-    if not all([host, user, pw, db]):
-        st.error("Credenciais do banco ausentes em st.secrets ou variáveis DB_*")
+    h = st.secrets.get("database", {}).get("host") or os.getenv("DB_HOST")
+    u = st.secrets.get("database", {}).get("user") or os.getenv("DB_USER")
+    p = st.secrets.get("database", {}).get("password") or os.getenv("DB_PASS")
+    n = st.secrets.get("database", {}).get("name") or os.getenv("DB_NAME")
+    if not all([h, u, p, n]):
+        st.error("Credenciais do banco ausentes.")
         return None
-    uri = f"mysql+mysqlconnector://{user}:{pw}@{host}/{db}"
+    uri = f"mysql+mysqlconnector://{u}:{p}@{h}/{n}"
     try:
         eng = create_engine(uri, pool_pre_ping=True, pool_recycle=3600)
         with eng.connect(): pass
         return eng
     except exc.SQLAlchemyError as e:
-        st.exception(e)
-        return None
+        st.exception(e); return None
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar_dados(eng: Engine) -> tuple[pd.DataFrame | None, Exception | None]:
-    """Lê atividades 'Verificar' Abertas + últimos 7 dias do histórico."""
-    hoje, limite = date.today(), date.today() - timedelta(days=7)
-    q_abertas = text("""
-        SELECT activity_id, activity_folder, user_profile_name, activity_date,
-               activity_status, Texto
-        FROM ViewGrdAtividadesTarcisio
-        WHERE activity_type='Verificar' AND activity_status='Aberta'""")
-    q_hist = text("""
-        SELECT activity_id, activity_folder, user_profile_name, activity_date,
-               activity_status, Texto
-        FROM ViewGrdAtividadesTarcisio
-        WHERE activity_type='Verificar' AND DATE(activity_date) >= :limite""")
+    hoje = date.today()
+    limite = hoje - timedelta(days=7)
+    q_abertas = text("SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto FROM ViewGrdAtividadesTarcisio WHERE activity_type='Verificar' AND activity_status='Aberta'")
+    q_hist = text("SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto FROM ViewGrdAtividadesTarcisio WHERE activity_type='Verificar' AND DATE(activity_date) >= :limite")
     try:
-        with eng.connect() as con:
-            df1 = pd.read_sql(q_abertas, con)
-            df2 = pd.read_sql(q_hist, con, params={"limite": limite})
+        with eng.connect() as c:
+            df1 = pd.read_sql(q_abertas, c); df2 = pd.read_sql(q_hist, c, params={"limite": limite})
         df = pd.concat([df1, df2], ignore_index=True)
-        if df.empty:
-            cols = ["activity_id","activity_folder","user_profile_name",
-                    "activity_date","activity_status","Texto"]
-            return pd.DataFrame(columns=cols), None
+        if df.empty: return pd.DataFrame(), None # Retorna DF vazio
         df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
         df["Texto"] = df["Texto"].astype(str).fillna("")
-        df = (df.sort_values(["activity_folder","activity_date","activity_id"],
-                             ascending=[True,False,False])
-                .drop_duplicates("activity_id"))
-        return df, None
+        df_sorted = df.sort_values(["activity_id", "activity_status"], ascending=[True, True])
+        df_deduped = df_sorted.drop_duplicates("activity_id", keep="first")
+        return df_deduped.sort_values(["activity_folder", "activity_date", "activity_id"], ascending=[True,False,False]).reset_index(drop=True), None
     except exc.SQLAlchemyError as e:
         return None, e
 
-# ═════════ CACHE DE SIMILARIDADE (em session_state) ═════════════════════════
-def sim_map_cached(df: pd.DataFrame, min_sim: float):
-    """Retorna (mapa, ids_dup) utilizando cache em session_state."""
-    sig = (tuple(sorted(df["activity_id"])), min_sim)
-    key = "simcache" + SUFFIX_STATE
-    if key in st.session_state and st.session_state[key]["sig"] == sig:
-        c = st.session_state[key]; return c["map"], c["dup"]
+def get_similarity_map_cached(df: pd.DataFrame, min_sim: float):
+    ids_tuple = tuple(sorted(df["activity_id"]))
+    signature = (ids_tuple, min_sim)
+    cache_key = "simcache" + SUFFIX_STATE
+    if cache_key in st.session_state and st.session_state[cache_key].get("sig") == signature:
+        c = st.session_state[cache_key]; return c["map"], c["dup"]
 
-    mapa, ids_dup = {}, set()
-    barra = st.sidebar.progress(0)
-    grupos = df.groupby("activity_folder")
+    dup_map, ids_dup = {}, set()
+    prog_placeholder = st.sidebar.empty(); prog_bar = st.sidebar.progress(0)
+    grupos = df.groupby("activity_folder"); total_grupos = len(grupos)
     for idx, (_, g) in enumerate(grupos):
-        barra.progress((idx+1) / grupos.ngroups)
+        prog_bar.progress((idx + 1) / total_grupos, text=f"Analisando {total_grupos} pastas...")
         acts = g.to_dict("records")
+        if len(acts) < 2: continue
         for i, a in enumerate(acts):
-            mapa.setdefault(a["activity_id"], [])
-            for b in acts[i+1:]:
+            dup_map.setdefault(a["activity_id"], [])
+            for b in acts[i + 1:]:
                 r = calcular_similaridade(a["Texto"], b["Texto"])
                 if r >= min_sim:
-                    c = cor_sim(r)
+                    c_color = cor_sim(r) # Renomeado para evitar conflito
                     ids_dup.update([a["activity_id"], b["activity_id"]])
-                    mapa[a["activity_id"]].append(dict(id=b["activity_id"], ratio=r, cor=c))
-                    mapa.setdefault(b["activity_id"], []).append(dict(id=a["activity_id"], ratio=r, cor=c))
-    barra.empty()
-    for k in mapa: mapa[k].sort(key=lambda x: x["ratio"], reverse=True)
-    st.session_state[key] = {"sig": sig, "map": mapa, "dup": ids_dup}
-    return mapa, ids_dup
+                    dup_map[a["activity_id"]].append(dict(id_similar=b["activity_id"], ratio=r, cor=c_color))
+                    dup_map.setdefault(b["activity_id"], []).append(dict(id_similar=a["activity_id"], ratio=r, cor=c_color))
+    prog_bar.empty(); prog_placeholder.empty()
+    for k in dup_map: dup_map[k].sort(key=lambda x: x["ratio"], reverse=True)
+    st.session_state[cache_key] = {"sig": signature, "map": dup_map, "dup": ids_dup}
+    return dup_map, ids_dup
 
-# ═════════ LINKS RÁPIDOS PARA ZFLOW ══════════════════════════════════════════
-link_z = lambda i: {
-    "antigo": f"https://zflow.zionbyonset.com.br/activity/3/details/{i}",
-    "novo"  : f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={i}#/fixcol1"
-}
+link_z = lambda i: {"antigo": f"https://zflow.zionbyonset.com.br/activity/3/details/{i}","novo": f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={i}#/fixcol1"}
 
-# ═════════ ESTADO PADRÃO DA SESSÃO ═══════════════════════════════════════════
-defaults = {
-    f"show_text{SUFFIX_STATE}": False,
-    f"full_act{SUFFIX_STATE}":  None,
-    f"cmp{SUFFIX_STATE}":       None,   # {"base_id": .., "comp_id": ..}
-    f"page{SUFFIX_STATE}":      0,
-    f"last_update{SUFFIX_STATE}": None,
-}
-for k, v in defaults.items():
-    st.session_state.setdefault(k, v)
+# Estado inicial
+for key_base in ["show_text_dialog", "full_act", "comparacao_ativa", "pagina_atual", "last_db_update_time"]:
+    full_key = f"{key_base}{SUFFIX_STATE}"
+    st.session_state.setdefault(full_key, False if "show" in key_base else (0 if "pagina" in key_base else None))
 
-# ═════════ DIALOG TEXTO COMPLETO ═════════════════════════════════════════════
 @st.dialog("Texto completo")
-def dlg_full():
+def dlg_full_text():
     d = st.session_state[f"full_act{SUFFIX_STATE}"]
     if d is None: return
     data_fmt = d["activity_date"].strftime("%d/%m/%Y %H:%M") if pd.notna(d["activity_date"]) else "N/A"
-    st.markdown(f"### ID {d['activity_id']} – {data_fmt}")
-    st.text_area("Texto", d["Texto"], height=400, disabled=True,
-                 key=f"dlg_txt_{d['activity_id']}{SUFFIX_STATE}")
-    if st.button("Fechar"):
-        st.session_state[f"show_text{SUFFIX_STATE}"] = False
+    st.markdown(f"### ID {d['activity_id']} • {data_fmt}")
+    st.text_area("Texto", d["Texto"], height=400, disabled=True, key=f"dlg_txt_{d['activity_id']}{SUFFIX_STATE}")
+    if st.button("Fechar", key=f"dlg_close_btn{SUFFIX_STATE}"):
+        st.session_state[f"show_text_dialog{SUFFIX_STATE}"] = False; st.rerun()
 
-# ═════════ APP PRINCIPAL ═════════════════════════════════════════════════════
+# ==============================================================================
+# APLICAÇÃO PRINCIPAL
+# ==============================================================================
 def app():
-    # Header / logout
     st.sidebar.success(f"Logado como **{st.session_state['username']}**")
-    if st.sidebar.button("Logout"):
+    if st.sidebar.button("Logout", key=f"logout_btn{SUFFIX_STATE}"):
         st.session_state.clear(); st.rerun()
 
-    eng = db_engine()
+    eng = db_engine();
     if not eng: st.stop()
 
-    # Botão atualizar dados
-    if st.sidebar.button("🔄 Atualizar dados"):
-        carregar_dados.clear()                           # limpa cache de dados
-        st.session_state.pop("simcache"+SUFFIX_STATE, None)  # limpa similaridade
-        st.session_state[f"last_update{SUFFIX_STATE}"] = datetime.now()
+    if st.sidebar.button("🔄 Atualizar Dados Base", key=f"update_btn{SUFFIX_STATE}"):
+        carregar_dados.clear()
+        st.session_state.pop("simcache" + SUFFIX_STATE, None)
+        st.session_state[f"comparacao_ativa{SUFFIX_STATE}"] = None
+        st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now()
+        st.toast("Dados base recarregados!", icon="🔄")
 
-    # Carrega dados
-    df, err = carregar_dados(eng)
-    if err:
-        st.exception(err); st.stop()
-    if df.empty:
-        st.warning("Sem atividades encontradas."); st.stop()
+    df_raw_total, err_db = carregar_dados(eng)
+    if err_db: st.exception(err_db); st.stop()
+    if df_raw_total.empty: st.warning("Sem atividades base carregadas."); st.stop()
+    
+    if not st.session_state.get(f"last_db_update_time{SUFFIX_STATE}"):
+        st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now()
+    last_update = st.session_state[f"last_db_update_time{SUFFIX_STATE}"]
+    st.sidebar.caption(f"Dados do banco atualizados em: {last_update:%d/%m/%Y %H:%M:%S}")
 
-    # Info de última atualização
-    up = st.session_state[f"last_update{SUFFIX_STATE}"]
-    if up: st.sidebar.caption(f"Dados atualizados em: {up:%d/%m/%Y %H:%M:%S}")
-    else:  st.sidebar.caption("Dados provenientes do cache.")
-
-    # Período
+    # --- Filtros ---
+    st.sidebar.header("Filtros")
     hoje = date.today()
-    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=1))
-    d_fim = st.sidebar.date_input("Fim",    hoje + timedelta(days=14), min_value=d_ini)
-    if d_ini > d_fim: st.sidebar.error("Início > fim."); st.stop()
-    df_per = df[(df["activity_date"].notna()) & df["activity_date"].dt.date.between(d_ini, d_fim)]
-    st.title(f"🔎 Duplicidades ({len(df_per)} atividades)")
+    data_inicio_padrao = hoje - timedelta(days=1)
+    df_abertas_futuras = df_raw_total[(df_raw_total["activity_status"] == "Aberta") & (df_raw_total["activity_date"].notna()) & (df_raw_total["activity_date"].dt.date > hoje)]
+    data_fim_padrao = df_abertas_futuras["activity_date"].dt.date.max() if not df_abertas_futuras.empty else hoje + timedelta(days=14)
+    if data_inicio_padrao > data_fim_padrao: data_inicio_padrao = data_fim_padrao - timedelta(days=1)
+    
+    d_ini = st.sidebar.date_input("Início", data_inicio_padrao, key=f"di_{SUFFIX_STATE}")
+    d_fim = st.sidebar.date_input("Fim", data_fim_padrao, min_value=d_ini, key=f"df_{SUFFIX_STATE}")
+    
+    df_periodo = df_raw_total[(df_raw_total["activity_date"].notna()) & df_raw_total["activity_date"].dt.date.between(d_ini, d_fim)]
+    st.title(f"🔎 Verificador de Duplicidade ({len(df_periodo)} atividades no período)")
+    
+    # --- Filtros de Análise e Exibição ---
+    pastas_disp = sorted(df_periodo["activity_folder"].dropna().unique())
+    pastas_sel = st.sidebar.multiselect("Pastas para Análise:", pastas_disp, key=f"psel_{SUFFIX_STATE}")
+    
+    df_para_analise = df_periodo.copy()
+    if pastas_sel: df_para_analise = df_para_analise[df_para_analise["activity_folder"].isin(pastas_sel)]
+    
+    status_disp = sorted(df_para_analise["activity_status"].dropna().unique())
+    status_sel_exibicao = st.sidebar.multiselect("Status para Exibição:", status_disp, key=f"ssel_exib_{SUFFIX_STATE}")
+    
+    min_sim = st.sidebar.slider("Similaridade Mínima (%):", 0, 100, 70, 5, key=f"sim_slider_{SUFFIX_STATE}") / 100
+    only_dup = st.sidebar.checkbox("Exibir Somente com Duplicatas", True, key=f"only_dup_{SUFFIX_STATE}")
+    
+    pastas_multi_analisadas = {p for p, g in df_para_analise.groupby("activity_folder") if g["user_profile_name"].nunique() > 1}
+    only_multi = st.sidebar.checkbox("Pastas com Múltiplos Responsáveis (na análise)", False, key=f"only_multi_{SUFFIX_STATE}")
+    
+    usuarios_disp_exibicao = sorted(df_para_analise["user_profile_name"].dropna().unique())
+    usuarios_sel_exibicao = st.sidebar.multiselect("Exibir Usuário(s):", usuarios_disp_exibicao, key=f"user_sel_{SUFFIX_STATE}")
 
-    # Filtros
-    pastas = sorted(df_per["activity_folder"].dropna().unique())
-    pastas_sel = st.sidebar.multiselect("Pastas", pastas)
-    status = sorted(df_per["activity_status"].dropna().unique())
-    status_sel = st.sidebar.multiselect("Status", status)
-    df_a = df_per.copy()
-    if pastas_sel: df_a = df_a[df_a["activity_folder"].isin(pastas_sel)]
-    if status_sel: df_a = df_a[df_a["activity_status"].isin(status_sel)]
+    # --- Análise de Similaridade ---
+    map_id_para_similaridades, ids_com_duplicatas = get_similarity_map_cached(df_para_analise, min_sim)
 
-    min_sim = st.sidebar.slider("Similaridade mínima (%)", 0, 100, 70, 5) / 100
-    only_dup = st.sidebar.checkbox("Somente duplicatas", True)
-    pastas_multi = {p for p, g in df_a.groupby("activity_folder")
-                    if g["user_profile_name"].nunique() > 1}
-    only_multi = st.sidebar.checkbox("Pastas com múltiplos responsáveis")
-    users_disp = sorted(df_a["user_profile_name"].dropna().unique())
-    users_sel = st.sidebar.multiselect("Usuários", users_disp)
+    # --- DataFrame Final para Exibição ---
+    df_exibir = df_para_analise.copy()
+    if status_sel_exibicao: df_exibir = df_exibir[df_exibir["activity_status"].isin(status_sel_exibicao)]
+    if only_dup: df_exibir = df_exibir[df_exibir["activity_id"].isin(ids_com_duplicatas)]
+    if only_multi: df_exibir = df_exibir[df_exibir["activity_folder"].isin(pastas_multi_analisadas)]
+    if usuarios_sel_exibicao: df_exibir = df_exibir[df_exibir["user_profile_name"].isin(usuarios_sel_exibicao)]
+    
+    # --- Exportação e Comparação ---
+    # (Lógica de exportação e seção de comparação como antes)
+    st.sidebar.markdown("---")
+    if st.sidebar.button("📥 Exportar para XLSX", key=f"export_btn{SUFFIX_STATE}"):
+        if df_exibir.empty: st.sidebar.warning("Nenhum dado para exportar.")
+        else:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df_exibir.to_excel(writer, index=False, sheet_name="Atividades_Exibidas")
+                lista_export_dup = []
+                # Usar map_id_para_similaridades que foi calculado sobre df_para_analise
+                for id_base, lista_sim in map_id_para_similaridades.items():
+                    if id_base in df_exibir["activity_id"].values:
+                        for sim_info in lista_sim:
+                            # Buscar detalhes da duplicata no df_raw_total
+                            detalhes_similar_rows = df_raw_total[df_raw_total["activity_id"] == sim_info["id_similar"]]
+                            if not detalhes_similar_rows.empty:
+                                detalhes_similar = detalhes_similar_rows.iloc[0]
+                                data_dup_str = (detalhes_similar["activity_date"].strftime("%Y-%m-%d %H:%M") if pd.notna(detalhes_similar["activity_date"]) else None)
+                                lista_export_dup.append({
+                                    "ID_Base": id_base, "ID_Duplicata": sim_info["id_similar"],
+                                    "Similaridade": sim_info["ratio"],"Cor": sim_info["cor"],
+                                    "Data_Dup": data_dup_str, "Usuario_Dup": detalhes_similar["user_profile_name"],
+                                    "Status_Dup": detalhes_similar["activity_status"],
+                                })
+                if lista_export_dup: pd.DataFrame(lista_export_dup).to_excel(writer, index=False, sheet_name="Detalhes_Duplicatas")
+            st.sidebar.download_button("Baixar XLSX", output.getvalue(),f"duplicatas_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    cmp_data = st.session_state[f"cmp{SUFFIX_STATE}"]
+    if cmp_data:
+        a_base, b_comp = df_raw_total[df_raw_total.activity_id == cmp_data["base_id"]].iloc[0], \
+                         df_raw_total[df_raw_total.activity_id == cmp_data["comp_id"]].iloc[0]
+        with st.container(border=True):
+            st.subheader(f"🔎 Comparação: ID `{a_base['activity_id']}` vs `{b_comp['activity_id']}`")
+            col1_cmp, col2_cmp = st.columns(2)
+            html_a, html_b = highlight_common_words(a_base["Texto"], b_comp["Texto"])
+            with col1_cmp: st.markdown(f"**ID {a_base['activity_id']}**<br>{html_a}", unsafe_allow_html=True)
+            with col2_cmp: st.markdown(f"**ID {b_comp['activity_id']}**<br>{html_b}", unsafe_allow_html=True)
+            if st.button("Ocultar Comparação", key=f"fechar_comp{SUFFIX_STATE}"):
+                st.session_state[f"cmp{SUFFIX_STATE}"] = None; st.rerun()
+        st.markdown("---")
 
-    # Similaridade (cache)
-    sim_map, ids_dup = sim_map_cached(df_a, min_sim)
+    st.header("Análise Detalhada por Pasta")
+    if df_exibir.empty: st.info("Nenhuma atividade para os filtros de exibição selecionados.")
 
-    # Exibição final
-    df_v = df_a.copy()
-    if only_dup:   df_v = df_v[df_v["activity_id"].isin(ids_dup)]
-    if only_multi: df_v = df_v[df_v["activity_folder"].isin(pastas_multi)]
-    if users_sel:  df_v = df_v[df_v["user_profile_name"].isin(users_sel)]
+    # --- Paginação e Listagem ---
+    # (Sua lógica de paginação e exibição de atividades, adaptada para as novas variáveis)
+    pastas_ord = sorted(df_exibir["activity_folder"].dropna().unique())
+    pagina_atual = st.session_state[f"page{SUFFIX_STATE}"]
+    total_paginas = max(1, (len(pastas_ord) + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA)
+    pagina_atual = max(0, min(pagina_atual, total_paginas - 1)); st.session_state[f"page{SUFFIX_STATE}"] = pagina_atual
 
-    # Paginação
-    pastas_ord = sorted(df_v["activity_folder"].dropna().unique())
-    page = st.session_state[f"page{SUFFIX_STATE}"]
-    total_pages = max(1, (len(pastas_ord) + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA)
-    page = max(0, min(page, total_pages - 1)); st.session_state[f"page{SUFFIX_STATE}"] = page
+    if total_paginas > 1:
+        c1,c2,c3 = st.columns([1,2,1])
+        if c1.button("⬅️", disabled=pagina_atual==0, key=f"prev_{SUFFIX_STATE}"): st.session_state[f"page{SUFFIX_STATE}"]-=1; st.rerun()
+        c2.markdown(f"<p style='text-align:center'>Página {pagina_atual+1}/{total_paginas}</p>", unsafe_allow_html=True)
+        if c3.button("➡️", disabled=pagina_atual>=total_paginas-1, key=f"next_{SUFFIX_STATE}"): st.session_state[f"page{SUFFIX_STATE}"]+=1; st.rerun()
 
-    if total_pages > 1:
-        col_prev, col_label, col_next = st.columns([1, 2, 1])
-        if col_prev.button("⬅", disabled=page == 0):
-            st.session_state[f"page{SUFFIX_STATE}"] -= 1; st.rerun()
-        col_label.markdown(f"<p style='text-align:center;'>Página {page+1}/{total_pages}</p>", unsafe_allow_html=True)
-        if col_next.button("➡", disabled=page == total_pages - 1):
-            st.session_state[f"page{SUFFIX_STATE}"] += 1; st.rerun()
-
-    # Loop pastas
-    cmp_state = st.session_state[f"cmp{SUFFIX_STATE}"]
-    start, end = page * ITENS_POR_PAGINA, (page + 1) * ITENS_POR_PAGINA
-    for pasta in pastas_ord[start:end]:
-        df_p = df_v[df_v["activity_folder"] == pasta]
-        analisadas = len(df_a[df_a["activity_folder"] == pasta])
-        with st.expander(f"📁 {pasta} ({len(df_p)}/{analisadas})"):
+    ini, fim = pagina_atual * ITENS_POR_PAGINA, (pagina_atual+1) * ITENS_POR_PAGINA
+    for pasta in pastas_ord[ini:fim]:
+        df_p = df_exibir[df_exibir["activity_folder"] == pasta]
+        analisadas = len(df_para_analise[df_para_analise["activity_folder"] == pasta])
+        with st.expander(f"📁 {pasta} ({len(df_p)} exibidas / {analisadas} analisadas)", expanded=False):
             for _, r in df_p.iterrows():
                 act_id = int(r["activity_id"])
-                col1, col2 = st.columns([.6, .4])
-                
-                # ---- Coluna Info principal ----
-                with col1:
-                    data_fmt = r["activity_date"].strftime("%d/%m/%Y %H:%M") if pd.notna(r["activity_date"]) else "N/A"
-                    st.markdown(f"**ID** `{act_id}` • {data_fmt} • `{r['activity_status']}`")
+                c1, c2 = st.columns([.6, .4])
+                with c1:
+                    data = r["activity_date"].strftime("%d/%m/%Y %H:%M") if pd.notna(r["activity_date"]) else "N/A"
+                    st.markdown(f"**ID** `{act_id}` • {data} • `{r['activity_status']}`")
                     st.markdown(f"**Usuário:** {r['user_profile_name']}")
-                    st.text_area("Texto", r["Texto"], height=100, disabled=True,
-                                 key=f"txt_{pasta}_{act_id}")
-                    st.button("👁 Completo",
-                              key=f"full_{act_id}",
-                              on_click=lambda act=r: st.session_state.update({
-                                  f"full_act{SUFFIX_STATE}": act,
-                                  f"show_text{SUFFIX_STATE}": True}))
+                    st.text_area("Texto", r["Texto"], height=100, disabled=True, key=f"txt_{pasta}_{act_id}")
+                    btn1, btn2, btn3 = st.columns(3)
+                    btn1.button("👁 Completo", key=f"full_{act_id}", on_click=lambda act=r: st.session_state.update({f"full_act{SUFFIX_STATE}": act, f"show_text{SUFFIX_STATE}": True}))
                     lnk = link_z(act_id)
-                    st.link_button("ZFlow v1", lnk["antigo"])
-                    st.link_button("ZFlow v2", lnk["novo"])
-
-                # ---- Coluna duplicatas ----
-                with col2:
-                    sims = sim_map.get(act_id, [])
+                    btn2.link_button("ZFlow v1", lnk["antigo"])
+                    btn3.link_button("ZFlow v2", lnk["novo"])
+                with c2:
+                    sims = map_id_para_similaridades.get(act_id, [])
                     if sims:
                         st.markdown(f"**Duplicatas:** {len(sims)}")
                         for s in sims:
-                            info = df[df["activity_id"] == s["id"]].iloc[0]
-                            badge = (f"<div class='similarity-badge' style='background:{s['cor']};'>"
-                                     f"<b>{info['activity_id']}</b> • {s['ratio']:.0%}<br>"
-                                     f"{info['activity_date'].strftime('%d/%m/%y %H:%M') if pd.notna(info['activity_date']) else 'N/A'}"
-                                     f" • {info['activity_status']}<br>{info['user_profile_name']}</div>")
-                            st.markdown(badge, unsafe_allow_html=True)
-                            st.button("⚖ Comparar",
-                                      key=f"cmp_{act_id}_{info['activity_id']}",
-                                      on_click=lambda a=act_id, b=int(info["activity_id"]):
-                                          st.session_state.update({f"cmp{SUFFIX_STATE}": {"base_id": a, "comp_id": b}}))
+                            # Busca no df_para_analise, que é o escopo onde as similaridades foram calculadas
+                            info_rows = df_para_analise[df_para_analise["activity_id"] == s["id_similar"]]
+                            if not info_rows.empty:
+                                info = info_rows.iloc[0]
+                                d = info["activity_date"].strftime("%d/%m/%y %H:%M") if pd.notna(info["activity_date"]) else "N/A"
+                                badge = (f"<div class='similarity-badge' style='background:{s['cor']};'>"
+                                         f"<b>{info['activity_id']}</b> • {s['ratio']:.0%}<br>"
+                                         f"{d} • {info['activity_status']}<br>{info['user_profile_name']}</div>")
+                                st.markdown(badge, unsafe_allow_html=True)
+                                st.button("⚖ Comparar", key=f"cmp_{act_id}_{info['activity_id']}",
+                                          on_click=lambda a=r, b=info: st.session_state.update({f"cmp{SUFFIX_STATE}": {"base_id": a.activity_id, "comp_id": b.activity_id}}))
                     elif not only_dup:
                         st.markdown("<span style='color:green;'>Sem duplicatas</span>", unsafe_allow_html=True)
+    if st.session_state[f"show_text{SUFFIX_STATE}"]: dlg_full_text()
 
-                # ---- Comparação embutida (se este item é o base selecionado) ----
-                if cmp_state and cmp_state["base_id"] == act_id:
-                    comp_id = cmp_state["comp_id"]
-                    texto_comp = df[df["activity_id"] == comp_id].iloc[0]["Texto"]
-                    html_a, html_b = highlight_common(r["Texto"], texto_comp)
-                    with st.container():
-                        st.markdown("---")
-                        st.markdown(f"### Comparação {act_id} × {comp_id}")
-                        col_a, col_b = st.columns(2)
-                        col_a.markdown(html_a, unsafe_allow_html=True)
-                        col_b.markdown(html_b, unsafe_allow_html=True)
-                        if st.button("❌ Fechar comparação", key=f"cls_cmp_{act_id}"):
-                            st.session_state[f"cmp{SUFFIX_STATE}"] = None
-                            st.rerun()
-
-    # Chama dialog texto completo, se ativo
-    if st.session_state[f"show_text{SUFFIX_STATE}"]:
-        dlg_full()
-
-# ═════════ LOGIN ═════════════════════════════════════════════════════════════
+# ==============================================================================
+# LOGIN
+# ==============================================================================
 def cred_ok(user: str, pwd: str) -> bool:
     cred = st.secrets.get("credentials", {}).get("usernames", {})
     return user in cred and str(cred[user]) == pwd
@@ -332,16 +342,13 @@ def login_form():
         u = st.text_input("Usuário")
         p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            if cred_ok(u, p):
-                st.session_state.update({"logged_in": True, "username": u}); st.rerun()
-            else:
-                st.error("Credenciais inválidas.")
+            if cred_ok(u, p): st.session_state.update({"logged_in": True, "username": u}); st.rerun()
+            else: st.error("Credenciais inválidas.")
 
-# ═════════ MAIN ══════════════════════════════════════════════════════════════
+# ==============================================================================
+# MAIN
+# ==============================================================================
 if __name__ == "__main__":
-    if not st.session_state.get("logged_in"):
-        st.session_state["logged_in"] = False
-    if st.session_state["logged_in"]:
-        app()
-    else:
-        login_form()
+    if not st.session_state.get("logged_in"): st.session_state["logged_in"] = False
+    if st.session_state["logged_in"]: app()
+    else: login_for
