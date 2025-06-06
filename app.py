@@ -8,15 +8,16 @@ from unidecode import unidecode
 from rapidfuzz import fuzz 
 import io
 import html 
+import os # Importar os para variáveis de ambiente
 
 # ==============================================================================
 # CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
-SUFFIX_STATE = "_comp_expander_v1" # Novo sufixo para esta versão
+SUFFIX_STATE = "_final_fix" # Novo sufixo para garantir um estado limpo
 ITENS_POR_PAGINA = 20 
 HIGHLIGHT_COLOR = "#a8d1ff" 
 
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Comp. no Expander)")
+st.set_page_config(layout="wide", page_title="Verificador de Duplicidade (Corrigido)")
 
 st.markdown(
     f"""
@@ -40,17 +41,13 @@ st.markdown(
         font-weight: 500;
         display: inline-block;
     }}
-    /* Para garantir que o container de comparação tenha largura total dentro do expander */
-    .comparison-container {{
-        width: 100%;
-    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ==============================================================================
-# FUNÇÕES AUXILIARES (semelhantes à versão anterior)
+# FUNÇÕES AUXILIARES
 # ==============================================================================
 def normalizar_texto(txt: str | None) -> str:
     if not txt or not isinstance(txt, str): return ""
@@ -116,7 +113,7 @@ def carregar_dados(eng: Engine) -> tuple[pd.DataFrame | None, Exception | None]:
         if df.empty: 
             cols = ["activity_id","activity_folder","user_profile_name","activity_date","activity_status","Texto","activity_type"]
             df_ret = pd.DataFrame(columns=cols); df_ret["activity_date"]=pd.Series(dtype="datetime64[ns]"); df_ret["Texto"]=pd.Series(dtype="object")
-            for col_name in cols: 
+            for col_name in cols:
                 if col_name not in df_ret.columns: df_ret[col_name] = pd.Series(dtype="object")
             df_ret["Texto"] = df_ret["Texto"].astype(str).fillna("")
             return df_ret, None
@@ -140,7 +137,7 @@ def get_similarity_map_cached(df: pd.DataFrame, min_sim: float):
     dup_map, ids_dup = {}, set()
     prog_placeholder = st.sidebar.empty(); prog_bar = st.sidebar.progress(0)
     total_grupos = df.groupby("activity_folder").ngroups if not df.empty else 0; prog_count = 0
-    for _, grp_iter in df.groupby("activity_folder"): # Renomeado
+    for folder_name_iter, grp_iter in df.groupby("activity_folder"):
         prog_count += 1
         if total_grupos > 0: prog_bar.progress(prog_count / total_grupos)
         atividades = grp_iter.to_dict("records")
@@ -161,14 +158,13 @@ def get_similarity_map_cached(df: pd.DataFrame, min_sim: float):
 
 link_z = lambda i: dict(antigo=f"https://zflow.zionbyonset.com.br/activity/3/details/{i}", novo  =f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={i}#/fixcol1")
 
-# Estado inicial
 for key_base in ["show_text_dialog", "full_act_dialog", "comparacao_ativa", "pagina_atual", "last_db_update_time"]:
     full_key = f"{key_base}{SUFFIX_STATE}"
     if full_key not in st.session_state:
         st.session_state[full_key] = False if "show" in key_base else (0 if "pagina" in key_base else None)
 
 @st.dialog("Texto completo")
-def dlg_full_text(): # Renomeado
+def dlg_full_text():
     d = st.session_state[f"full_act_dialog{SUFFIX_STATE}"]
     if d is None: return
     data_fmt = d["activity_date"].strftime("%d/%m/%Y %H:%M") if pd.notna(d["activity_date"]) else "N/A"
@@ -182,17 +178,10 @@ def on_click_ver_texto_completo(atividade):
     st.session_state[f"show_text_dialog{SUFFIX_STATE}"] = True
 
 def on_click_comparar_textos(atividade_base, atividade_comparar):
-    # Armazena os IDs e um identificador da "atividade_base" atual para o qual a comparação foi ativada.
-    st.session_state[f"comparacao_ativa{SUFFIX_STATE}"] = {
-        "id_pai": atividade_base['activity_id'], # ID da atividade que originou a comparação
-        "base": atividade_base, 
-        "comp": atividade_comparar
-    }
-    # st.rerun() # O rerun é implícito com o on_click do botão
+    st.session_state[f"comparacao_ativa{SUFFIX_STATE}"] = {"base": atividade_base, "comp": atividade_comparar}
 
 def fechar_comparacao_textos():
     st.session_state[f"comparacao_ativa{SUFFIX_STATE}"] = None
-    # st.rerun() # O rerun é implícito ao mudar o estado que controla a exibição
 
 # ==============================================================================
 # APLICAÇÃO PRINCIPAL
@@ -202,7 +191,7 @@ def app():
     if st.sidebar.button("Logout", key=f"logout_btn{SUFFIX_STATE}_app"):
         st.session_state.clear(); st.rerun()
 
-    eng = db_engine(); 
+    eng = db_engine()
     if not eng: st.stop()
 
     if st.sidebar.button("🔄 Atualizar Dados Base", key=f"update_data_btn{SUFFIX_STATE}"):
@@ -210,21 +199,22 @@ def app():
         cache_key_sim = f"simcache{SUFFIX_STATE}"
         if cache_key_sim in st.session_state: del st.session_state[cache_key_sim]
         st.session_state[f"comparacao_ativa{SUFFIX_STATE}"] = None
-        st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now() # Atualiza o timestamp
+        st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now()
         st.toast("Dados base recarregados!", icon="🔄")
     
     df_raw_total, erro_db = carregar_dados(eng)
     if erro_db: st.exception(erro_db); st.stop()
     if df_raw_total.empty: st.warning("Sem atividades base carregadas."); st.stop()
 
+    if st.session_state.get(f"last_db_update_time{SUFFIX_STATE}") is None:
+        if not erro_db and not df_raw_total.empty:
+            st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now()
+    
     last_update_val = st.session_state.get(f"last_db_update_time{SUFFIX_STATE}")
-    if not last_update_val and not erro_db and not df_raw_total.empty: # Se é a primeira carga bem-sucedida
-        st.session_state[f"last_db_update_time{SUFFIX_STATE}"] = datetime.now()
-        last_update_val = st.session_state[f"last_db_update_time{SUFFIX_STATE}"]
-
     if isinstance(last_update_val, datetime):
         st.sidebar.caption(f"Dados do banco atualizados em: {last_update_val.strftime('%d/%m/%Y %H:%M:%S')}")
-    else: st.sidebar.caption("Clique em 'Atualizar Dados Base'.")
+    else:
+        st.sidebar.caption("Clique em 'Atualizar Dados Base'.")
 
     st.sidebar.header("Período (Exibição)")
     hoje = date.today()
@@ -234,7 +224,7 @@ def app():
     if data_inicio_padrao > data_fim_padrao: data_inicio_padrao = data_fim_padrao - timedelta(days=1) if data_fim_padrao > hoje else hoje - timedelta(days=1)
     
     d_ini = st.sidebar.date_input("Início", data_inicio_padrao, key=f"di{SUFFIX_STATE}")
-    d_fim = st.sidebar.date_input("Fim", data_fim_padrao, min_value=d_ini, key=f"df{SUFFIX_STATE}")
+    d_fim = st.sidebar.date_input("Fim", d_fim_padrao, min_value=d_ini, key=f"df{SUFFIX_STATE}")
     if d_ini > d_fim: st.sidebar.error("Início > fim."); st.stop()
     
     df_periodo = df_raw_total[(df_raw_total["activity_date"].notna()) & df_raw_total["activity_date"].dt.date.between(d_ini, d_fim)]
@@ -246,24 +236,24 @@ def app():
     status_disp = sorted(df_periodo["activity_status"].dropna().unique().tolist())
     status_sel = st.sidebar.multiselect("Status", status_disp, key=f"ssel{SUFFIX_STATE}")
 
-    df_para_analise_final = df_periodo.copy() # Renomeado para clareza
-    if pastas_sel: df_para_analise_final = df_para_analise_final[df_para_analise_final["activity_folder"].isin(pastas_sel)]
-    if status_sel: df_para_analise_final = df_para_analise_final[df_para_analise_final["activity_status"].isin(status_sel)]
+    df_para_analise_corrigido = df_periodo.copy()
+    if pastas_sel: df_para_analise_corrigido = df_para_analise_corrigido[df_para_analise_corrigido["activity_folder"].isin(pastas_sel)]
+    if status_sel: df_para_analise_corrigido = df_para_analise_corrigido[df_para_analise_corrigido["activity_status"].isin(status_sel)]
 
     st.sidebar.header("Exibição")
     min_sim_exib = st.sidebar.slider("Similaridade mínima (%)", 0, 100, 70, 5, key=f"sim_exib{SUFFIX_STATE}") / 100
     only_dup = st.sidebar.checkbox("Somente com duplicatas", True, key=f"only_dup{SUFFIX_STATE}")
-    pastas_multi_exib = {p for p, g in df_para_analise_final.groupby("activity_folder") if g["user_profile_name"].nunique() > 1} if not df_para_analise_final.empty else set()
+    pastas_multi_exib = {p for p, g in df_para_analise_corrigido.groupby("activity_folder") if g["user_profile_name"].nunique() > 1} if not df_para_analise_corrigido.empty else set()
     only_multi = st.sidebar.checkbox("Pastas com múltiplos responsáveis", False, key=f"only_multi{SUFFIX_STATE}")
-    usuarios_disp_final = sorted(df_para_analise_final["user_profile_name"].dropna().unique()) if not df_para_analise_final.empty else []
+    usuarios_disp_final = sorted(df_para_analise_corrigido["user_profile_name"].dropna().unique()) if not df_para_analise_corrigido.empty else []
     usuarios_sel_final = st.sidebar.multiselect("Exibir Usuário(s) (final):", usuarios_disp_final, default=[], key=f"user_final{SUFFIX_STATE}")
     
-    if not df_para_analise_final.empty and len(df_para_analise_final) > 1:
-        map_id_para_similaridades, ids_com_duplicatas_calculados = get_similarity_map_cached(df_para_analise_final, min_sim_exib)
+    if not df_para_analise_corrigido.empty and len(df_para_analise_corrigido) > 1:
+        map_id_para_similaridades, ids_com_duplicatas_calculados = get_similarity_map_cached(df_para_analise_corrigido, min_sim_exib)
     else:
         map_id_para_similaridades, ids_com_duplicatas_calculados = {}, set()
     
-    df_v = df_para_analise_final.copy()
+    df_v = df_para_analise_corrigido.copy()
     if only_dup: df_v = df_v[df_v["activity_id"].isin(ids_com_duplicatas_calculados)]
     if only_multi: df_v = df_v[df_v["activity_folder"].isin(pastas_multi_exib)]
     if usuarios_sel_final: df_v = df_v[df_v["user_profile_name"].isin(usuarios_sel_final)]
@@ -292,6 +282,24 @@ def app():
                 if lista_export_dup: pd.DataFrame(lista_export_dup).to_excel(writer, index=False, sheet_name="Detalhes_Duplicatas")
             st.sidebar.download_button("Baixar XLSX", output.getvalue(),f"duplicatas_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    cmp_data = st.session_state.get(f"comparacao_ativa{SUFFIX_STATE}")
+    if cmp_data:
+        a_base, b_comp = cmp_data["base"], cmp_data["comp"]
+        with st.container(border=True):
+            ratio_atual = 0
+            if a_base["activity_id"] in map_id_para_similaridades:
+                for sim_entry in map_id_para_similaridades[a_base["activity_id"]]:
+                    if sim_entry["id_similar"] == b_comp["activity_id"]:
+                        ratio_atual = sim_entry["ratio"]; break
+            st.subheader(f"🔎 Comparação: ID `{a_base['activity_id']}` vs `{b_comp['activity_id']}` (Similaridade: {ratio_atual:.0%})")
+            col1_cmp, col2_cmp = st.columns(2)
+            html_a, html_b = highlight_common_words(a_base["Texto"], b_comp["Texto"])
+            with col1_cmp: st.markdown(f"**ID {a_base['activity_id']} (Base)**<br>{html_a}", unsafe_allow_html=True)
+            with col2_cmp: st.markdown(f"**ID {b_comp['activity_id']} (Similar)**<br>{html_b}", unsafe_allow_html=True)
+            if st.button("Ocultar Comparação", key=f"fechar_comp{SUFFIX_STATE}"):
+                fechar_comparacao_textos(); st.rerun()
+        st.markdown("---")
+
     st.header("Análise Detalhada por Pasta")
     if df_v.empty: st.info("Nenhuma atividade para os filtros de exibição selecionados.")
 
@@ -304,48 +312,27 @@ def app():
         pagina_atual = max(0, min(pagina_atual, total_paginas - 1)) 
         st.session_state[f"page{SUFFIX_STATE}"] = pagina_atual
         if total_paginas > 1:
-            b1_pag, pg_info_col_pag, b2_pag = st.columns([1, 2, 1]) # Renomeado para evitar conflito
-            if b1_pag.button("⬅", disabled=page == 0, key=f"prev_btn_pag{SUFFIX_STATE}"):
-                st.session_state[f"page{SUFFIX_STATE}"] -=1; st.rerun()
-            pg_info_col_pag.markdown(f"<p style='text-align:center;'>Página {page+1}/{total_paginas}</p>", unsafe_allow_html=True)
-            if b2_pag.button("➡", disabled=(page >= total_paginas -1), key=f"next_btn_pag{SUFFIX_STATE}"):
-                st.session_state[f"page{SUFFIX_STATE}"] +=1; st.rerun()
+            b1, pg_info_col, b2 = st.columns([1, 2, 1])
+            if b1.button("⬅", disabled=pagina_atual == 0, key=f"prev_btn{SUFFIX_STATE}"):
+                st.session_state[f"page{SUFFIX_STATE}"] -= 1; st.rerun()
+            pg_info_col.markdown(f"<p style='text-align:center;'>Página {pagina_atual+1}/{total_paginas}</p>", unsafe_allow_html=True)
+            if b2.button("➡", disabled=(pagina_atual >= total_paginas - 1), key=f"next_btn{SUFFIX_STATE}"):
+                st.session_state[f"page{SUFFIX_STATE}"] += 1; st.rerun()
 
-        ini, fim = page * ITENS_POR_PAGINA, (page + 1) * ITENS_POR_PAGINA
+        ini, fim = pagina_atual * ITENS_POR_PAGINA, (pagina_atual + 1) * ITENS_POR_PAGINA
         for pasta_nome_loop in pastas_ord[ini:fim]:
             df_p_loop = df_v[df_v["activity_folder"] == pasta_nome_loop]
             if df_p_loop.empty: continue
-            total_analisado_pasta_loop = len(df_para_analise_final[df_para_analise_final["activity_folder"] == pasta_nome_loop])
-            titulo_exp_loop = f"📁 {pasta_nome_loop} ({len(df_p_loop)} exibidas / {total_analisado_pasta_loop} analisadas)"
             
-            with st.expander(titulo_exp_loop, expanded=False): # ALTERADO PARA expanded=False POR PADRÃO
+            # --- CORREÇÃO APLICADA AQUI ---
+            # Usar a variável correta que foi filtrada para análise (pasta/status)
+            total_analisado_pasta = len(df_para_analise_corrigido[df_para_analise_corrigido["activity_folder"] == pasta_nome_loop])
+            titulo_exp = f"📁 {pasta_nome_loop} ({len(df_p_loop)} exibidas / {total_analisado_pasta} analisadas)"
+            
+            with st.expander(titulo_exp, expanded=False): # Alterado para expanded=False
                 for _, r_item_loop in df_p_loop.iterrows():
                     atividade_item_dict = r_item_loop.to_dict()
                     st.markdown("---")
-                    
-                    # Se esta atividade é a base de uma comparação ativa, mostra a comparação aqui
-                    comparacao_ativa_data = st.session_state.get(f"comparacao_ativa{SUFFIX_STATE}")
-                    if comparacao_ativa_data and comparacao_ativa_data["base"]["activity_id"] == atividade_item_dict["activity_id"]:
-                        base_c_local, comparar_c_local = comparacao_ativa_data["base"], comparacao_ativa_data["comp"]
-                        
-                        with st.container(border=True):
-                            ratio_atual_local = 0 # Calcular ou buscar o ratio para exibir
-                            if base_c_local["activity_id"] in map_id_para_similaridades:
-                                for sim_entry_local in map_id_para_similaridades[base_c_local["activity_id"]]:
-                                    if sim_entry_local["id_similar"] == comparar_c_local["activity_id"]:
-                                        ratio_atual_local = sim_entry_local["ratio"]; break
-                            st.markdown(f"##### Comparando ID `{base_c_local['activity_id']}` vs `{comparar_c_local['activity_id']}` (Similaridade: {ratio_atual_local:.0%})")
-                            
-                            html_a_local, html_b_local = highlight_common_words(base_c_local["Texto"], comparar_c_local["Texto"])
-                            col1_local_comp, col2_local_comp = st.columns(2)
-                            with col1_local_comp: st.markdown(f"**ID {base_c_local['activity_id']} (Base)**<br>{html_a_local}", unsafe_allow_html=True)
-                            with col2_local_comp: st.markdown(f"**ID {comparar_c_local['activity_id']} (Similar)**<br>{html_b_local}", unsafe_allow_html=True)
-                            
-                            if st.button("Ocultar Comparação", key=f"fechar_comp_local{SUFFIX_STATE}_{base_c_local['activity_id']}_{comparar_c_local['activity_id']}"):
-                                fechar_comparacao_textos(); st.rerun()
-                        st.markdown("---") # Linha separadora após a comparação
-
-
                     col_info_render, col_sim_render = st.columns([.6, .4])
                     with col_info_render:
                         data_render_str = atividade_item_dict["activity_date"].strftime("%d/%m/%Y %H:%M") if pd.notna(atividade_item_dict["activity_date"]) else "N/A"
@@ -372,10 +359,10 @@ def app():
                                                            f"<b>ID: {inf_render['activity_id']}</b> ({s_render['ratio']:.0%})<br>"
                                                            f"{d_render_str} • {inf_render['activity_status']}<br>{inf_render['user_profile_name']}"
                                                            "</div>", unsafe_allow_html=True)
-                                    cont_dup_render.button("⚖ Comparar Textos", key=f"cmp_render_item{SUFFIX_STATE}_{atividade_item_dict['activity_id']}_{inf_render['activity_id']}", on_click=on_click_comparar_textos, args=(atividade_item_dict, inf_render))
+                                    cont_dup_render.button("⚖ Comparar", key=f"cmp_render_item{SUFFIX_STATE}_{atividade_item_dict['activity_id']}_{inf_render['activity_id']}", on_click=on_click_comparar_textos, args=(atividade_item_dict, inf_render))
                         elif not only_dup: st.markdown("<span style='color:green;'>Sem duplicatas</span>", unsafe_allow_html=True)
     else:
-        if not df_para_analise_final.empty : st.info("Nenhuma atividade para os filtros de exibição.") # Usar df_para_analise_final
+        if not df_para_analise_corrigido.empty : st.info("Nenhuma atividade para os filtros de exibição.") # Usar df_para_analise_corrigido
 
     if st.session_state.get(f"show_text_dialog{SUFFIX_STATE}"): dlg_full_text()
 
