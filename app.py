@@ -7,7 +7,6 @@ from sqlalchemy import create_engine, text, exc
 from sqlalchemy.engine import Engine
 from unidecode import unidecode
 from rapidfuzz import fuzz
-from difflib import SequenceMatcher  # NOVO import
 
 # ═════════════════ CONFIG ═════════════════
 SUFFIX = "_final_v8_corrigido"
@@ -44,25 +43,19 @@ def calc_sim(a:str,b:str)->float:
 
 cor_sim = lambda r:"#FF5252" if r>=.9 else "#FFB74D" if r>=.7 else "#FFD54F"
 
-# ─────────── NOVA FUNÇÃO DE DESTAQUE ───────────
-def highlight_diff(a:str, b:str) -> tuple[str, str]:
-    split_a, split_b = a.split(), b.split()
-    sm = SequenceMatcher(None, split_a, split_b, autojunk=False)
-    def build(side_words, opcodes_side):
-        html_parts = []
-        for tag, i1, i2, *_ in opcodes_side:
-            words = side_words[i1:i2]
-            chunk = html.escape(" ".join(words))
-            if tag == 'equal':
-                html_parts.append(f"<mark class='common'>{chunk}</mark>")
-            else:
-                html_parts.append(chunk)
-        return "<pre class='highlighted-text'>" + " ".join(html_parts) + "</pre>"
-
-    ops = sm.get_opcodes()
-    # opcodes: (tag, a_i1, a_i2, b_j1, b_j2)
-    return build(split_a, [(t,i1,i2,None,None) for t,i1,i2,_,_ in ops]), \
-           build(split_b, [(t,None,None,j1,j2) for t,_,_,j1,j2 in ops])
+def highlight_common(t1:str,t2:str,min_len:int=3):
+    tk1 = re.findall(r"\w+",norm(t1))
+    tk2 = set(re.findall(r"\w+",norm(t2)))
+    comuns = {w for w in tk1 if w in tk2 and len(w)>=min_len}
+    def wrap(txt):
+        seg=[]
+        for part in re.split(r"(\W+)",txt):
+            if not part: continue
+            if re.match(r"\w+",part) and norm(part) in comuns:
+                seg.append(f"<mark class='common'>{html.escape(part)}</mark>")
+            else: seg.append(html.escape(part))
+        return "<pre class='highlighted-text'>"+"".join(seg)+"</pre>"
+    return wrap(t1),wrap(t2)
 
 # ═════════════ DB ═════════════
 @st.cache_resource
@@ -236,15 +229,15 @@ def app():
                         for s in sims:
                             info=idx_map.get(s["id"])
                             if not info: continue
-                            info_id = s["id"]
+                            info_id = s["id"]                 # ★ FIX: id vem do sim_map
                             d = as_sp(info["activity_date"])
                             d_fmt = d.strftime("%d/%m/%y %H:%M") if d else "N/A"
                             st.markdown(f"<div class='similarity-badge' style='background:{s['cor']};'>"
-                                        f"<b>{info_id}</b> • {s['ratio']:.0%}<br>"
+                                        f"<b>{info_id}</b> • {s['ratio']:.0%}<br>"   # ★ usa info_id
                                         f"{d_fmt} • {info['activity_status']}<br>{info['user_profile_name']}"
                                         "</div>",unsafe_allow_html=True)
                             st.button("⚖ Comparar",
-                                      key=f"cmp_{page}_{pasta}_{act}_{info_id}",
+                                      key=f"cmp_{page}_{pasta}_{act}_{info_id}",   # ★ usa info_id
                                       on_click=lambda a=act,b=info_id:
                                           st.session_state.update({f"cmp{SUFFIX}":{"base_id":a,"comp_id":b}}))
                     elif not only_dup:
@@ -253,12 +246,9 @@ def app():
                 if cmp_state and cmp_state["base_id"]==act:
                     comp=idx_map.get(cmp_state["comp_id"])
                     if comp:
-                        # ─── usa nova função highlight_diff ───
-                        hA,hB=highlight_diff(row.Texto,comp["Texto"])
-                        st.markdown("---")
-                        colA,colB=st.columns(2)
-                        colA.markdown(hA,unsafe_allow_html=True)
-                        colB.markdown(hB,unsafe_allow_html=True)
+                        hA,hB=highlight_common(row.Texto,comp["Texto"])
+                        st.markdown("---"); colA,colB=st.columns(2)
+                        colA.markdown(hA,unsafe_allow_html=True); colB.markdown(hB,unsafe_allow_html=True)
                         if st.button("❌ Fechar comparação",key=f"cls_{act}_{page}"):
                             st.session_state[f"cmp{SUFFIX}"]=None; st.rerun()
 
