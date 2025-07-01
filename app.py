@@ -83,18 +83,18 @@ def calc_sim(a: str, b: str) -> float:
 def cor_sim(r: float) -> str:
     return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
-# (VERSÃO FINAL - CORRIGIDA)
+# (VERSÃO FINAL E DEFINITIVA DA FUNÇÃO)
 def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
     """
     Compara dois textos e destaca as diferenças (adições/remoções)
-    preservando a formatação original (espaços, quebras de linha).
+    usando uma tokenização granular que preserva palavras e pontuações.
     """
     t1, t2 = (t1 or ""), (t2 or "")
     
-    # Tokeniza os textos em palavras e delimitadores (espaços, \n, etc.)
-    # Isso preserva a formatação original do texto.
-    t1_tokens = re.split(r'(\s+)', t1)
-    t2_tokens = re.split(r'(\s+)', t2)
+    # Tokeniza em qualquer caractere não-alfanumérico (\W+), mantendo os delimitadores.
+    # Isso separa palavras, espaços e pontuações de forma eficaz.
+    t1_tokens = [token for token in re.split(r'(\W+)', t1) if token]
+    t2_tokens = [token for token in re.split(r'(\W+)', t2) if token]
 
     sm = SequenceMatcher(None, t1_tokens, t2_tokens, autojunk=False)
 
@@ -133,7 +133,8 @@ def db_engine() -> Engine | None:
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar(eng: Engine) -> pd.DataFrame:
-    lim=date.today()-timedelta(days=7)
+    # A data do WHERE foi ajustada para um período maior para garantir que os dados de exemplo sejam carregados
+    lim=date.today()-timedelta(days=90) 
     q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
                    activity_date,activity_status,Texto
                    FROM ViewGrdAtividadesTarcisio
@@ -227,7 +228,8 @@ def app():
 
     st.sidebar.header("Filtros")
     hoje = date.today()
-    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
+    # Intervalo de datas padrão ajustado para garantir que os exemplos apareçam
+    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=40))
     d_fim = st.sidebar.date_input("Fim", hoje + timedelta(days=14), min_value=d_ini)
     if d_ini > d_fim:
         st.sidebar.error("Data de início não pode ser maior que a data de fim."); st.stop()
@@ -324,7 +326,6 @@ def app():
                         ratio_str = f"{sim_info['ratio']:.0%}" if sim_info else "N/A"
                         st.markdown("---")
                         
-                        # (NOVO) Legenda adicionada
                         st.markdown("""
                         <div style="font-size: 0.85em; margin-bottom: 10px; padding: 5px; background-color: #f0f2f6; border-radius: 5px;">
                             <b>Legenda:</b>
