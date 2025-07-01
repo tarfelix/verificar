@@ -44,7 +44,7 @@ st.markdown("""
         border: 1px solid #ddd;
         border-radius: 5px;
         background-color: #f9f9f9;
-        height: 350px; 
+        height: 400px; 
         overflow-y: auto;
     }
     .similarity-badge {
@@ -52,11 +52,11 @@ st.markdown("""
         display: inline-block; margin-bottom: 4px;
     }
     .highlighted-text del {
-        background-color: #ffcdd2; 
+        background-color: #ffcdd2; /* Vermelho claro */
         text-decoration: none;
     }
     .highlighted-text ins {
-        background-color: #c8e6c9; 
+        background-color: #c8e6c9; /* Verde claro */
         text-decoration: none;
     }
 </style>
@@ -83,29 +83,42 @@ def calc_sim(a: str, b: str) -> float:
 def cor_sim(r: float) -> str:
     return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
+# (VERSÃO FINAL - CORRIGIDA)
 def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
+    """
+    Compara dois textos e destaca as diferenças (adições/remoções)
+    preservando a formatação original (espaços, quebras de linha).
+    """
     t1, t2 = (t1 or ""), (t2 or "")
-    sm = SequenceMatcher(None, t1.split(), t2.split(), autojunk=False) # Comparando por palavras
     
-    out1, out2 = [], []
-    t1_words, t2_words = t1.split(), t2.split()
+    # Tokeniza os textos em palavras e delimitadores (espaços, \n, etc.)
+    # Isso preserva a formatação original do texto.
+    t1_tokens = re.split(r'(\s+)', t1)
+    t2_tokens = re.split(r'(\s+)', t2)
 
+    sm = SequenceMatcher(None, t1_tokens, t2_tokens, autojunk=False)
+
+    out1, out2 = [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        slice1 = html.escape("".join(t1_tokens[i1:i2]))
+        slice2 = html.escape("".join(t2_tokens[j1:j2]))
+
         if tag == 'equal':
-            out1.append(" ".join(t1_words[i1:i2]))
-            out2.append(" ".join(t2_words[j1:j2]))
-        else:
-            if tag in ('replace', 'delete'):
-                out1.append(f"<del>{html.escape(' '.join(t1_words[i1:i2]))}</del>")
-            if tag in ('replace', 'insert'):
-                out2.append(f"<ins>{html.escape(' '.join(t2_words[j1:j2]))}</ins>")
-    
-    h1 = f"<pre class='highlighted-text'>{' '.join(out1)}</pre>"
-    h2 = f"<pre class='highlighted-text'>{' '.join(out2)}</pre>"
+            out1.append(slice1)
+            out2.append(slice2)
+        elif tag == 'replace':
+            out1.append(f"<del>{slice1}</del>")
+            out2.append(f"<ins>{slice2}</ins>")
+        elif tag == 'delete':
+            out1.append(f"<del>{slice1}</del>")
+        elif tag == 'insert':
+            out2.append(f"<ins>{slice2}</ins>")
+            
+    h1 = f"<pre class='highlighted-text'>{''.join(out1)}</pre>"
+    h2 = f"<pre class='highlighted-text'>{''.join(out2)}</pre>"
     return h1, h2
 
-# ═════════════ BANCO DE DADOS ═════════════
-
+# ═════════════ BANCO DE DADOS (Inalterado) ═════════════
 @st.cache_resource
 def db_engine() -> Engine | None:
     cfg=st.secrets.get("database",{})
@@ -146,18 +159,15 @@ def carregar(eng: Engine) -> pd.DataFrame:
         logging.exception(e); st.error("Erro SQL"); return pd.DataFrame()
 
 
-# ═════════════ CACHE DE SIMILARIDADE ═════════════
-
+# ═════════════ LÓGICA DO APP (Inalterado na maior parte) ═════════════
 def sim_cache(df: pd.DataFrame, min_sim: float):
     sig = (tuple(sorted(df["activity_id"])), min_sim)
     cached = st.session_state.get(SK.SIM_CACHE)
     if cached and cached.get("sig") == sig:
         return cached["map"], cached["dup"]
-
     mapa, dup = {}, set()
     bar = st.sidebar.progress(0, text="Calculando similaridades…")
     groups = list(df.groupby("activity_folder"))
-    
     for i, (_, g) in enumerate(groups, 1):
         bar.progress(i / len(groups), text=f"Calculando... {i}/{len(groups)} pastas")
         acts = g.to_dict("records")
@@ -170,38 +180,24 @@ def sim_cache(df: pd.DataFrame, min_sim: float):
                     mapa[a["activity_id"]].append({"id": b["activity_id"], "ratio": r, "cor": cor_sim(r)})
                     mapa.setdefault(b["activity_id"], []).append({"id": a["activity_id"], "ratio": r, "cor": cor_sim(r)})
     bar.empty()
-
     for k in mapa:
         mapa[k].sort(key=lambda z: z["ratio"], reverse=True)
-        
     st.session_state[SK.SIM_CACHE] = {"sig": sig, "map": mapa, "dup": dup}
     return mapa, dup
 
-
-# ═════════════ ESTADO INICIAL ═════════════
-
 def init_session_state():
     defaults = {
-        SK.LOGGED_IN: False,
-        SK.USERNAME: "",
-        SK.LAST_UPDATE: None,
-        SK.SIM_CACHE: None,
-        SK.PAGE: 0,
-        SK.SHOW_FULL_TEXT_DIALOG: False,
-        SK.FULL_TEXT_DATA: None,
-        SK.COMPARE_STATE: None
+        SK.LOGGED_IN: False, SK.USERNAME: "", SK.LAST_UPDATE: None,
+        SK.SIM_CACHE: None, SK.PAGE: 0, SK.SHOW_FULL_TEXT_DIALOG: False,
+        SK.FULL_TEXT_DATA: None, SK.COMPARE_STATE: None
     }
     for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-# ═════════════ DIÁLOGO DE TEXTO COMPLETO ═════════════
+        st.session_state.setdefault(k, v)
 
 @st.dialog("Texto completo")
 def show_full_text_dialog():
     d = st.session_state.get(SK.FULL_TEXT_DATA)
     if not d: return
-    
     dt = as_sp(d["activity_date"])
     st.markdown(f"### ID {d['activity_id']} – {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'}")
     st.text_area("Texto Completo", d['Texto'], height=400, disabled=True)
@@ -209,13 +205,10 @@ def show_full_text_dialog():
         st.session_state[SK.SHOW_FULL_TEXT_DIALOG] = False
         st.rerun()
 
-# ═════════════ APLICATIVO PRINCIPAL ═════════════
-
 def app():
     st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
     if st.sidebar.button("Logout"):
-        st.session_state.clear()
-        st.rerun()
+        st.session_state.clear(); st.rerun()
 
     eng = db_engine()
     if not eng: st.stop()
@@ -227,20 +220,17 @@ def app():
 
     df = carregar(eng)
     if df.empty:
-        st.warning("Nenhuma atividade encontrada para análise.")
-        st.stop()
+        st.warning("Nenhuma atividade encontrada para análise."); st.stop()
     
     up = st.session_state.get(SK.LAST_UPDATE) or datetime.now(TZ_SP)
     st.sidebar.caption(f"Dados de {up:%d/%m/%Y %H:%M:%S}")
 
-    # --- FILTROS DA SIDEBAR ---
     st.sidebar.header("Filtros")
     hoje = date.today()
     d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
     d_fim = st.sidebar.date_input("Fim", hoje + timedelta(days=14), min_value=d_ini)
     if d_ini > d_fim:
-        st.sidebar.error("Data de início não pode ser maior que a data de fim.")
-        st.stop()
+        st.sidebar.error("Data de início não pode ser maior que a data de fim."); st.stop()
 
     df_per = df[df["activity_date"].notna() & df["activity_date"].dt.date.between(d_ini, d_fim)]
     
@@ -253,7 +243,6 @@ def app():
     only_multi = st.sidebar.checkbox("Apenas pastas com múltiplos responsáveis")
     users_sel = st.sidebar.multiselect("Usuários", sorted(df_ana["user_profile_name"].dropna().unique()))
     
-    # --- LÓGICA DE FILTRAGEM ---
     sim_map, dup_ids = sim_cache(df_ana, min_sim)
 
     df_view = df_ana.copy()
@@ -270,10 +259,8 @@ def app():
     pastas_ord = sorted(df_view["activity_folder"].dropna().unique())
     
     if not pastas_ord:
-        st.info("Nenhum resultado para os filtros selecionados.")
-        st.stop()
+        st.info("Nenhum resultado para os filtros selecionados."); st.stop()
 
-    # --- PAGINAÇÃO ---
     total_paginas = max(1, (len(pastas_ord) + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA)
     page_num = st.session_state.get(SK.PAGE, 0)
     page_num = max(0, min(page_num, total_paginas - 1))
@@ -281,20 +268,17 @@ def app():
     
     if total_paginas > 1:
         l, mid, r = st.columns([1, 2, 1])
-        if l.button("⬅", disabled=page_num == 0):
-            st.session_state[SK.PAGE] -= 1; st.rerun()
+        if l.button("⬅", disabled=page_num == 0): st.session_state[SK.PAGE] -= 1; st.rerun()
         mid.markdown(f"<p style='text-align:center'>Página {page_num + 1}/{total_paginas}</p>", unsafe_allow_html=True)
-        if r.button("➡", disabled=page_num == total_paginas - 1):
-            st.session_state[SK.PAGE] += 1; st.rerun()
+        if r.button("➡", disabled=page_num == total_paginas - 1): st.session_state[SK.PAGE] += 1; st.rerun()
 
-    # --- RENDERIZAÇÃO DAS PASTAS ---
     cmp_state = st.session_state.get(SK.COMPARE_STATE)
     pastas_na_pagina = pastas_ord[page_num * ITENS_POR_PAGINA : (page_num + 1) * ITENS_POR_PAGINA]
 
     for pasta in pastas_na_pagina:
         df_p = df_view[df_view["activity_folder"] == pasta]
         total_na_pasta_analisada = len(df_ana[df_ana["activity_folder"] == pasta])
-        exp_title = f"📁 {pasta} ({len(df_p)} atividades exibidas de {total_na_pasta_analisada} na análise)"
+        exp_title = f"📁 {pasta} ({len(df_p)} de {total_na_pasta_analisada} na análise)"
         
         with st.expander(exp_title, expanded=True):
             for row in df_p.itertuples(index=False):
@@ -310,11 +294,9 @@ def app():
                     if b1.button("👁 Texto Completo", key=f"full_{act_id}"):
                         st.session_state[SK.FULL_TEXT_DATA] = row._asdict()
                         st.session_state[SK.SHOW_FULL_TEXT_DIALOG] = True
-                    
                     link_zflow_v1 = f"https://zflow.zionbyonset.com.br/activity/3/details/{act_id}"
                     link_zflow_v2 = f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={act_id}#/fixcol1"
-                    b2.link_button("ZFlow v1", link_zflow_v1)
-                    b3.link_button("ZFlow v2", link_zflow_v2)
+                    b2.link_button("ZFlow v1", link_zflow_v1); b3.link_button("ZFlow v2", link_zflow_v2)
 
                 with c2:
                     sims = sim_map.get(act_id, [])
@@ -323,75 +305,58 @@ def app():
                         for s in sims[:5]:
                             info = idx_map.get(s["id"])
                             if not info: continue
-                            
                             d = as_sp(info["activity_date"])
                             d_fmt = d.strftime("%d/%m/%y %H:%M") if d else "N/A"
                             badge_html = (
                                 f"<div class='similarity-badge' style='background:{s['cor']};'>"
                                 f"<b>ID {s['id']}</b> • {s['ratio']:.0%}<br>"
                                 f"{d_fmt} • {info['user_profile_name']}"
-                                "</div>"
-                            )
+                                "</div>")
                             st.markdown(badge_html, unsafe_allow_html=True)
-                            
                             if st.button("⚖️ Comparar", key=f"cmp_{act_id}_{s['id']}"):
                                 st.session_state[SK.COMPARE_STATE] = CompareState(base_id=act_id, comp_id=s['id'])
                                 st.rerun()
 
-                # --- LÓGICA DE COMPARAÇÃO VISUAL ---
                 if cmp_state and cmp_state.base_id == act_id:
                     comp_data = idx_map.get(cmp_state.comp_id)
                     if comp_data:
-                        # (CORREÇÃO) Busca a informação de similaridade novamente para garantir que está no escopo correto.
-                        sim_info = next((sim for sim in sim_map.get(act_id, []) if sim['id'] == cmp_state.comp_id), None)
+                        sim_info = next((s for s in sim_map.get(act_id, []) if s['id'] == cmp_state.comp_id), None)
                         ratio_str = f"{sim_info['ratio']:.0%}" if sim_info else "N/A"
-
                         st.markdown("---")
-                        # Usa a função de diff para obter os textos com realce
+                        
+                        # (NOVO) Legenda adicionada
+                        st.markdown("""
+                        <div style="font-size: 0.85em; margin-bottom: 10px; padding: 5px; background-color: #f0f2f6; border-radius: 5px;">
+                            <b>Legenda:</b>
+                            <span style="background-color: #ffcdd2; padding: 0 3px; margin: 0 5px;">Texto removido do original</span> |
+                            <span style="background-color: #c8e6c9; padding: 0 3px; margin: 0 5px;">Texto adicionado no comparado</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
                         hA, hB = highlight_diffs(row.Texto, comp_data["Texto"])
                         
                         colA, colB = st.columns(2)
                         with colA:
-                            st.markdown(f"**Original: ID {act_id}**")
-                            st.markdown(hA, unsafe_allow_html=True)
+                            st.markdown(f"**Original: ID {act_id}**"); st.markdown(hA, unsafe_allow_html=True)
                         with colB:
-                            # (CORREÇÃO) Usa a variável 'ratio_str' que acabamos de buscar.
-                            st.markdown(f"**Comparado: ID {cmp_state.comp_id} ({ratio_str})**")
-                            st.markdown(hB, unsafe_allow_html=True)
+                            st.markdown(f"**Comparado: ID {cmp_state.comp_id} ({ratio_str})**"); st.markdown(hB, unsafe_allow_html=True)
                         
                         if st.button("❌ Fechar Comparação", key=f"cls_{act_id}_{cmp_state.comp_id}"):
-                            st.session_state[SK.COMPARE_STATE] = None
-                            st.rerun()
-
+                            st.session_state[SK.COMPARE_STATE] = None; st.rerun()
                 st.divider()
 
-
-    if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]:
-        show_full_text_dialog()
-
-
-# ═════════════ TELA DE LOGIN ═════════════
+    if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]: show_full_text_dialog()
 
 def login():
     st.header("Login")
     with st.form("login_form_main"):
-        u = st.text_input("Usuário")
-        p = st.text_input("Senha", type="password")
+        u = st.text_input("Usuário"); p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            creds = st.secrets.get("credentials", {})
-            users = creds.get("usernames", {})
+            creds = st.secrets.get("credentials", {}); users = creds.get("usernames", {})
             if u in users and str(users[u]) == p:
-                st.session_state[SK.LOGGED_IN] = True
-                st.session_state[SK.USERNAME] = u
-                st.rerun()
-            else:
-                st.error("Credenciais inválidas.")
-
-# ═════════════ PONTO DE ENTRADA ═════════════
+                st.session_state[SK.LOGGED_IN] = True; st.session_state[SK.USERNAME] = u; st.rerun()
+            else: st.error("Credenciais inválidas.")
 
 if __name__ == "__main__":
     init_session_state()
-    if st.session_state.get(SK.LOGGED_IN):
-        app()
-    else:
-        login()
+    (app() if st.session_state.get(SK.LOGGED_IN) else login())
