@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import re, html, os, logging
@@ -7,59 +8,113 @@ from sqlalchemy import create_engine, text, exc
 from sqlalchemy.engine import Engine
 from unidecode import unidecode
 from rapidfuzz import fuzz
+from difflib import SequenceMatcher # (NOVO) Biblioteca para comparar sequências
+from dataclasses import dataclass # (NOVO) Para um estado de comparação mais limpo
 
-# ═════════════════ CONFIG ═════════════════
-SUFFIX = "_final_v8_corrigido"
+# ═════════════════ CONFIGURAÇÕES GLOBAIS ═════════════════
+
 ITENS_POR_PAGINA = 20
-TZ_SP  = ZoneInfo("America/Sao_Paulo")
+TZ_SP = ZoneInfo("America/Sao_Paulo")
 TZ_UTC = ZoneInfo("UTC")
-HIGHLIGHT_COLOR = "#a8d1ff"
 
+# (NOVO) Centralizando as chaves do session_state para evitar erros de digitação
+class SK:
+    LOGGED_IN = "logged_in"
+    USERNAME = "username"
+    LAST_UPDATE = "last_update"
+    SIM_CACHE = "sim_cache"
+    PAGE = "page"
+    SHOW_FULL_TEXT_DIALOG = "show_text_dialog"
+    FULL_TEXT_DATA = "full_text_data"
+    COMPARE_STATE = "compare_state"
+
+# (NOVO) Dataclass para o estado de comparação, mais claro que um dicionário
+@dataclass
+class CompareState:
+    base_id: int
+    comp_id: int
+
+# (ALTERADO) CSS agora inclui estilos para inserções (ins) e deleções (del)
 st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
-st.markdown(f"""
+st.markdown("""
 <style>
- mark.common {{background:{HIGHLIGHT_COLOR};padding:0 2px;font-weight:bold}}
- pre.highlighted-text {{white-space:pre-wrap;word-wrap:break-word;
-  font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,Courier,monospace;
-  font-size:.9em;padding:10px;border:1px solid #ddd;border-radius:5px;background:#f9f9f9}}
- .similarity-badge {{padding:3px 6px;border-radius:5px;color:black;font-weight:500;display:inline-block;margin-bottom:4px}}
+    pre.highlighted-text {
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+        font-size: .9em;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        background-color: #f9f9f9;
+        height: 300px; /* Altura fixa para alinhar os botões */
+        overflow-y: auto; /* Adiciona scroll se o texto for muito grande */
+    }
+    .similarity-badge {
+        padding: 3px 6px; border-radius: 5px; color: black; font-weight: 500;
+        display: inline-block; margin-bottom: 4px;
+    }
+    /* (NOVO) Estilos para o "diff" visual */
+    .highlighted-text del {
+        background-color: #ffcdd2; /* Vermelho claro para texto removido */
+        text-decoration: line-through;
+    }
+    .highlighted-text ins {
+        background-color: #c8e6c9; /* Verde claro para texto adicionado */
+        text-decoration: none;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ═════════════ HELPERS ═════════════
+
+# ═════════════ FUNÇÕES AUXILIARES ═════════════
+
 def as_sp(ts: pd.Timestamp | None):
     if pd.isna(ts): return None
     if ts.tzinfo is None: ts = ts.tz_localize(TZ_UTC)
     return ts.tz_convert(TZ_SP)
 
-def norm(t:str|None)->str:
-    if not isinstance(t,str): return ""
-    return re.sub(r"\s+"," ",re.sub(r"[^\w\s]"," ",unidecode(t.lower()))).strip()
+def norm(t: str | None) -> str:
+    if not isinstance(t, str): return ""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", unidecode(t.lower()))).strip()
 
-def calc_sim(a:str,b:str)->float:
-    a,b = map(norm,(a,b))
-    if not a or not b or abs(len(a)-len(b))>.3*max(len(a),len(b)): return 0.0
-    return fuzz.token_set_ratio(a,b)/100
+def calc_sim(a: str, b: str) -> float:
+    a_norm, b_norm = norm(a), norm(b)
+    if not a_norm or not b_norm or abs(len(a_norm) - len(b_norm)) > 0.3 * max(len(a_norm), len(b_norm)):
+        return 0.0
+    return fuzz.token_set_ratio(a_norm, b_norm) / 100
 
-cor_sim = lambda r:"#FF5252" if r>=.9 else "#FFB74D" if r>=.7 else "#FFD54F"
+def cor_sim(r: float) -> str:
+    return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
-def highlight_common(t1:str,t2:str,min_len:int=3):
-    tk1 = re.findall(r"\w+",norm(t1))
-    tk2 = set(re.findall(r"\w+",norm(t2)))
-    comuns = {w for w in tk1 if w in tk2 and len(w)>=min_len}
-    def wrap(txt):
-        seg=[]
-        for part in re.split(r"(\W+)",txt):
-            if not part: continue
-            if re.match(r"\w+",part) and norm(part) in comuns:
-                seg.append(f"<mark class='common'>{html.escape(part)}</mark>")
-            else: seg.append(html.escape(part))
-        return "<pre class='highlighted-text'>"+"".join(seg)+"</pre>"
-    return wrap(t1),wrap(t2)
+# (ALTERADO) Nova função de realce usando difflib para mostrar diferenças
+def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
+    t1, t2 = (t1 or ""), (t2 or "")
+    sm = SequenceMatcher(None, t1, t2)
+    
+    out1, out2 = [], []
 
-# ═════════════ DB ═════════════
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            out1.append(html.escape(t1[i1:i2]))
+            out2.append(html.escape(t2[j1:j2]))
+        elif tag == 'replace':
+            out1.append(f"<del>{html.escape(t1[i1:i2])}</del>")
+            out2.append(f"<ins>{html.escape(t2[j1:j2])}</ins>")
+        elif tag == 'delete':
+            out1.append(f"<del>{html.escape(t1[i1:i2])}</del>")
+        elif tag == 'insert':
+            out2.append(f"<ins>{html.escape(t2[j1:j2])}</ins>")
+
+    h1 = f"<pre class='highlighted-text'>{''.join(out1)}</pre>"
+    h2 = f"<pre class='highlighted-text'>{''.join(out2)}</pre>"
+    return h1, h2
+
+# ═════════════ BANCO DE DADOS ═════════════
+
 @st.cache_resource
 def db_engine() -> Engine | None:
+    # ... (código do banco de dados inalterado)
     cfg=st.secrets.get("database",{})
     host,user,pw,db=[cfg.get(k) or os.getenv(f"DB_{k.upper()}") for k in["host","user","password","name"]]
     if not all([host,user,pw,db]): st.error("Credenciais de banco ausentes."); return None
@@ -70,8 +125,9 @@ def db_engine() -> Engine | None:
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro ao conectar."); return None
 
-@st.cache_data(ttl=3600,hash_funcs={Engine:lambda _:None})
-def carregar(eng:Engine)->pd.DataFrame:
+@st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
+def carregar(eng: Engine) -> pd.DataFrame:
+    # ... (código de carregamento inalterado)
     lim=date.today()-timedelta(days=7)
     q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
                    activity_date,activity_status,Texto
@@ -97,175 +153,250 @@ def carregar(eng:Engine)->pd.DataFrame:
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro SQL"); return pd.DataFrame()
 
-# ═════════════ SIM CACHE ═════════════
-def sim_cache(df:pd.DataFrame,min_sim:float):
-    sig=(tuple(sorted(df["activity_id"])),min_sim)
-    key="simcache"+SUFFIX
-    c=st.session_state.get(key)
-    if c and c["sig"]==sig: return c["map"],c["dup"]
-    mapa,dup=set(),{}
-    dup=set(); mapa={}
-    bar=st.sidebar.progress(0,text="Calculando similaridades…")
-    groups=list(df.groupby("activity_folder"))
-    for i,(_,g) in enumerate(groups,1):
-        bar.progress(i/len(groups),text=f"{i}/{len(groups)} pastas")
-        acts=g.to_dict("records")
-        for idx,a in enumerate(acts):
-            mapa.setdefault(a["activity_id"],[])
-            for b in acts[idx+1:]:
-                r=calc_sim(a["Texto"],b["Texto"])
-                if r>=min_sim:
-                    ccor=cor_sim(r)
-                    dup.update([a["activity_id"],b["activity_id"]])
-                    mapa[a["activity_id"]].append(dict(id=b["activity_id"],ratio=r,cor=ccor))
-                    mapa.setdefault(b["activity_id"],[]).append(dict(id=a["activity_id"],ratio=r,cor=ccor))
+
+# ═════════════ CACHE DE SIMILARIDADE ═════════════
+
+def sim_cache(df: pd.DataFrame, min_sim: float):
+    # (ALTERADO) Usa a chave centralizada do SK
+    sig = (tuple(sorted(df["activity_id"])), min_sim)
+    cached = st.session_state.get(SK.SIM_CACHE)
+    if cached and cached.get("sig") == sig:
+        return cached["map"], cached["dup"]
+
+    mapa, dup = {}, set()
+    bar = st.sidebar.progress(0, text="Calculando similaridades…")
+    groups = list(df.groupby("activity_folder"))
+    
+    for i, (_, g) in enumerate(groups, 1):
+        bar.progress(i / len(groups), text=f"Calculando... {i}/{len(groups)} pastas")
+        acts = g.to_dict("records")
+        for idx, a in enumerate(acts):
+            mapa.setdefault(a["activity_id"], [])
+            for b in acts[idx + 1:]:
+                r = calc_sim(a["Texto"], b["Texto"])
+                if r >= min_sim:
+                    dup.update([a["activity_id"], b["activity_id"]])
+                    mapa[a["activity_id"]].append({"id": b["activity_id"], "ratio": r, "cor": cor_sim(r)})
+                    mapa.setdefault(b["activity_id"], []).append({"id": a["activity_id"], "ratio": r, "cor": cor_sim(r)})
     bar.empty()
-    for k in mapa: mapa[k].sort(key=lambda z:z["ratio"],reverse=True)
-    st.session_state[key]={"sig":sig,"map":mapa,"dup":dup}
-    return mapa,dup
 
-# ═════════════ STATE DEFAULTS ═════════════
-for k,v in {f"show_text{SUFFIX}":False,f"full_act{SUFFIX}":None,
-            f"cmp{SUFFIX}":None,f"page{SUFFIX}":0,
-            f"last_update{SUFFIX}":None}.items():
-    st.session_state.setdefault(k,v)
+    for k in mapa:
+        mapa[k].sort(key=lambda z: z["ratio"], reverse=True)
+        
+    st.session_state[SK.SIM_CACHE] = {"sig": sig, "map": mapa, "dup": dup}
+    return mapa, dup
 
-# ═════════════ LINK ZFLOW ═════════════
-link_z=lambda i:{"antigo":f"https://zflow.zionbyonset.com.br/activity/3/details/{i}",
-                 "novo":f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={i}#/fixcol1"}
 
-# ═════════════ DIALOG TEXTO ═════════════
+# ═════════════ ESTADO INICIAL ═════════════
+
+def init_session_state():
+    defaults = {
+        SK.LOGGED_IN: False,
+        SK.USERNAME: "",
+        SK.LAST_UPDATE: None,
+        SK.SIM_CACHE: None,
+        SK.PAGE: 0,
+        SK.SHOW_FULL_TEXT_DIALOG: False,
+        SK.FULL_TEXT_DATA: None,
+        SK.COMPARE_STATE: None
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+# ═════════════ DIÁLOGO DE TEXTO COMPLETO ═════════════
+
 @st.dialog("Texto completo")
-def dlg_full():
-    d=st.session_state[f"full_act{SUFFIX}"]
-    if d is None: return
-    dt=as_sp(d["activity_date"])
+def show_full_text_dialog():
+    d = st.session_state.get(SK.FULL_TEXT_DATA)
+    if not d: return
+    
+    dt = as_sp(d["activity_date"])
     st.markdown(f"### ID {d['activity_id']} – {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'}")
-    st.markdown(f"<pre style='max-height:400px;overflow:auto'>{html.escape(d['Texto'])}</pre>",unsafe_allow_html=True)
-    st.button("Fechar",on_click=lambda:st.session_state.update({f"show_text{SUFFIX}":False}))
+    st.text_area("Texto Completo", d['Texto'], height=400, disabled=True)
+    if st.button("Fechar"):
+        st.session_state[SK.SHOW_FULL_TEXT_DIALOG] = False
+        st.rerun()
 
-# ═════════════ APP ═════════════
+# ═════════════ APLICATIVO PRINCIPAL ═════════════
+
 def app():
-    st.sidebar.success(f"Logado como **{st.session_state['username']}**")
-    if st.sidebar.button("Logout"): st.session_state.clear(); st.rerun()
+    st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
+    if st.sidebar.button("Logout"):
+        st.session_state.clear()
+        st.rerun()
 
-    eng=db_engine(); st.session_state["eng"]=eng
+    eng = db_engine()
     if not eng: st.stop()
 
     if st.sidebar.button("🔄 Atualizar dados"):
-        carregar.clear(); st.session_state.pop("simcache"+SUFFIX,None)
-        st.session_state[f"last_update{SUFFIX}"]=datetime.now(TZ_SP)
+        carregar.clear()
+        st.session_state[SK.SIM_CACHE] = None
+        st.session_state[SK.LAST_UPDATE] = datetime.now(TZ_SP)
 
-    df=carregar(eng)
-    if df.empty: st.warning("Sem atividades."); st.stop()
+    df = carregar(eng)
+    if df.empty:
+        st.warning("Nenhuma atividade encontrada para análise.")
+        st.stop()
+    
+    up = st.session_state.get(SK.LAST_UPDATE) or datetime.now(TZ_SP)
+    st.sidebar.caption(f"Dados de {up:%d/%m/%Y %H:%M:%S}")
 
-    up=st.session_state[f"last_update{SUFFIX}"] or datetime.now(TZ_SP)
-    st.sidebar.caption(f"Dados atualizados em: {up:%d/%m/%Y %H:%M:%S}")
+    # --- FILTROS DA SIDEBAR ---
+    st.sidebar.header("Filtros")
+    hoje = date.today()
+    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=1))
+    d_fim = st.sidebar.date_input("Fim", hoje + timedelta(days=14), min_value=d_ini)
+    if d_ini > d_fim:
+        st.sidebar.error("Data de início não pode ser maior que a data de fim.")
+        st.stop()
 
-    hoje=date.today()
-    d_ini=st.sidebar.date_input("Início",hoje-timedelta(days=1))
-    d_fim=st.sidebar.date_input("Fim",hoje+timedelta(days=14),min_value=d_ini)
-    if d_ini>d_fim: st.sidebar.error("Início > fim."); st.stop()
+    df_per = df[df["activity_date"].notna() & df["activity_date"].dt.date.between(d_ini, d_fim)]
+    
+    pastas_sel = st.sidebar.multiselect("Pastas p/ Análise", sorted(df_per["activity_folder"].dropna().unique()))
+    df_ana = df_per if not pastas_sel else df_per[df_per["activity_folder"].isin(pastas_sel)]
 
-    df_per=df[df["activity_date"].notna() & df["activity_date"].dt.date.between(d_ini,d_fim)]
-    st.title(f"🔎 Duplicidades ({len(df_per)})")
+    status_sel = st.sidebar.multiselect("Status", sorted(df_ana["activity_status"].dropna().unique()))
+    min_sim = st.sidebar.slider("Similaridade mínima (%)", 0, 100, 90, 5) / 100
+    only_dup = st.sidebar.checkbox("Mostrar somente duplicatas", True)
+    only_multi = st.sidebar.checkbox("Apenas pastas com múltiplos responsáveis")
+    users_sel = st.sidebar.multiselect("Usuários", sorted(df_ana["user_profile_name"].dropna().unique()))
+    
+    # --- LÓGICA DE FILTRAGEM ---
+    sim_map, dup_ids = sim_cache(df_ana, min_sim)
 
-    pastas_sel=st.sidebar.multiselect("Pastas p/ Análise",sorted(df_per["activity_folder"].dropna().unique()))
-    df_ana=df_per if not pastas_sel else df_per[df_per["activity_folder"].isin(pastas_sel)]
-
-    status_sel=st.sidebar.multiselect("Status p/ Exibição",sorted(df_ana["activity_status"].dropna().unique()))
-    min_sim=st.sidebar.slider("Similaridade mínima (%)",0,100,90,5)/100
-    only_dup=st.sidebar.checkbox("Somente duplicatas",True)
-    only_multi=st.sidebar.checkbox("Pastas com múltiplos responsáveis")
-    users_sel=st.sidebar.multiselect("Usuários",sorted(df_ana["user_profile_name"].dropna().unique()))
-
-    sim_map,dup_ids=sim_cache(df_ana,min_sim)
-
-    df_view=df_ana.copy()
-    if status_sel: df_view=df_view[df_view["activity_status"].isin(status_sel)]
-    if only_dup:  df_view=df_view[df_view["activity_id"].isin(dup_ids)]
+    df_view = df_ana.copy()
+    if status_sel: df_view = df_view[df_view["activity_status"].isin(status_sel)]
+    if only_dup: df_view = df_view[df_view["activity_id"].isin(dup_ids)]
     if only_multi:
-        mult={p for p,g in df_ana.groupby("activity_folder") if g["user_profile_name"].nunique()>1}
-        df_view=df_view[df_view["activity_folder"].isin(mult)]
-    if users_sel: df_view=df_view[df_view["user_profile_name"].isin(users_sel)]
+        mult = {p for p, g in df_ana.groupby("activity_folder") if g["user_profile_name"].nunique() > 1}
+        df_view = df_view[df_view["activity_folder"].isin(mult)]
+    if users_sel: df_view = df_view[df_view["user_profile_name"].isin(users_sel)]
+    
+    st.title(f"🔎 Análise de Duplicidades ({len(df_view)} atividades exibidas)")
+    
+    idx_map = df_ana.set_index("activity_id").to_dict("index")
+    pastas_ord = sorted(df_view["activity_folder"].dropna().unique())
+    
+    if not pastas_ord:
+        st.info("Nenhum resultado para os filtros selecionados.")
+        st.stop()
 
-    idx_map=df_ana.set_index("activity_id").to_dict("index")
+    # --- PAGINAÇÃO ---
+    total_paginas = max(1, (len(pastas_ord) + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA)
+    page_num = st.session_state.get(SK.PAGE, 0)
+    page_num = max(0, min(page_num, total_paginas - 1))
+    st.session_state[SK.PAGE] = page_num
+    
+    if total_paginas > 1:
+        l, mid, r = st.columns([1, 2, 1])
+        if l.button("⬅", disabled=page_num == 0):
+            st.session_state[SK.PAGE] -= 1; st.rerun()
+        mid.markdown(f"<p style='text-align:center'>Página {page_num + 1}/{total_paginas}</p>", unsafe_allow_html=True)
+        if r.button("➡", disabled=page_num == total_paginas - 1):
+            st.session_state[SK.PAGE] += 1; st.rerun()
 
-    pastas_ord=sorted(df_view["activity_folder"].dropna().unique())
-    page=st.session_state[f"page{SUFFIX}"]
-    total=max(1,(len(pastas_ord)+ITENS_POR_PAGINA-1)//ITENS_POR_PAGINA)
-    page=max(0,min(page,total-1)); st.session_state[f"page{SUFFIX}"]=page
+    # --- RENDERIZAÇÃO DAS PASTAS ---
+    cmp_state = st.session_state.get(SK.COMPARE_STATE)
+    pastas_na_pagina = pastas_ord[page_num * ITENS_POR_PAGINA : (page_num + 1) * ITENS_POR_PAGINA]
 
-    if total>1:
-        l,mid,r=st.columns([1,2,1])
-        if l.button("⬅",disabled=page==0): st.session_state[f"page{SUFFIX}"]-=1; st.rerun()
-        mid.markdown(f"<p style='text-align:center'>Página {page+1}/{total}</p>",unsafe_allow_html=True)
-        if r.button("➡",disabled=page==total-1): st.session_state[f"page{SUFFIX}"]+=1; st.rerun()
-
-    cmp_state=st.session_state[f"cmp{SUFFIX}"]
-
-    for pasta in pastas_ord[page*ITENS_POR_PAGINA:(page+1)*ITENS_POR_PAGINA]:
-        df_p=df_view[df_view["activity_folder"]==pasta]
-        total_ana=len(df_ana[df_ana["activity_folder"]==pasta])
-        with st.expander(f"📁 {pasta} ({len(df_p)}/{total_ana})"):
-            for row in df_p.itertuples():
-                act=row.activity_id
-                c1,c2=st.columns([.6,.4],gap="small")
+    for pasta in pastas_na_pagina:
+        df_p = df_view[df_view["activity_folder"] == pasta]
+        total_na_pasta_analisada = len(df_ana[df_ana["activity_folder"] == pasta])
+        exp_title = f"📁 {pasta} ({len(df_p)} atividades exibidas de {total_na_pasta_analisada} na análise)"
+        
+        with st.expander(exp_title, expanded=True):
+            for row in df_p.itertuples(index=False):
+                act_id = row.activity_id
+                c1, c2 = st.columns([.6, .4], gap="large")
 
                 with c1:
-                    dt=as_sp(row.activity_date)
-                    st.markdown(f"**ID** `{act}` • {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'} • `{row.activity_status}`")
+                    dt = as_sp(row.activity_date)
+                    st.markdown(f"**ID:** {act_id}  •  **Status:** {row.activity_status}  •  **Data:** {dt.strftime('%d/%m/%y %H:%M') if dt else 'N/A'}")
                     st.markdown(f"**Usuário:** {row.user_profile_name}")
-                    st.text_area("Texto",row.Texto,height=100,disabled=True,key=f"txt_{pasta}_{act}_{page}")
-                    b1,b2,b3=st.columns(3)
-                    b1.button("👁 Completo",key=f"full_{pasta}_{act}_{page}",
-                              on_click=lambda r=row: st.session_state.update({f"full_act{SUFFIX}":r._asdict(),f"show_text{SUFFIX}":True}))
-                    links=link_z(act); b2.link_button("ZFlow v1",links["antigo"]); b3.link_button("ZFlow v2",links["novo"])
+                    
+                    b1, b2, b3 = st.columns(3)
+                    if b1.button("👁 Texto Completo", key=f"full_{act_id}"):
+                        st.session_state[SK.FULL_TEXT_DATA] = row._asdict()
+                        st.session_state[SK.SHOW_FULL_TEXT_DIALOG] = True
+                    
+                    link_zflow_v1 = f"https://zflow.zionbyonset.com.br/activity/3/details/{act_id}"
+                    link_zflow_v2 = f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={act_id}#/fixcol1"
+                    b2.link_button("ZFlow v1", link_zflow_v1)
+                    b3.link_button("ZFlow v2", link_zflow_v2)
 
                 with c2:
-                    sims=sim_map.get(act,[])
+                    sims = sim_map.get(act_id, [])
                     if sims:
-                        st.markdown(f"**Duplicatas:** {len(sims)}")
-                        for s in sims:
-                            info=idx_map.get(s["id"])
+                        st.markdown(f"**Duplicatas Encontradas:** {len(sims)}")
+                        for s in sims[:5]: # Limita a exibição para não poluir a tela
+                            info = idx_map.get(s["id"])
                             if not info: continue
-                            info_id = s["id"]                 # ★ FIX: id vem do sim_map
+                            
                             d = as_sp(info["activity_date"])
                             d_fmt = d.strftime("%d/%m/%y %H:%M") if d else "N/A"
-                            st.markdown(f"<div class='similarity-badge' style='background:{s['cor']};'>"
-                                        f"<b>{info_id}</b> • {s['ratio']:.0%}<br>"   # ★ usa info_id
-                                        f"{d_fmt} • {info['activity_status']}<br>{info['user_profile_name']}"
-                                        "</div>",unsafe_allow_html=True)
-                            st.button("⚖ Comparar",
-                                      key=f"cmp_{page}_{pasta}_{act}_{info_id}",   # ★ usa info_id
-                                      on_click=lambda a=act,b=info_id:
-                                          st.session_state.update({f"cmp{SUFFIX}":{"base_id":a,"comp_id":b}}))
-                    elif not only_dup:
-                        st.markdown("<span style='color:green;'>Sem duplicatas</span>",unsafe_allow_html=True)
+                            badge_html = (
+                                f"<div class='similarity-badge' style='background:{s['cor']};'>"
+                                f"<b>ID {s['id']}</b> • {s['ratio']:.0%}<br>"
+                                f"{d_fmt} • {info['user_profile_name']}"
+                                "</div>"
+                            )
+                            st.markdown(badge_html, unsafe_allow_html=True)
+                            
+                            if st.button("⚖️ Comparar", key=f"cmp_{act_id}_{s['id']}"):
+                                st.session_state[SK.COMPARE_STATE] = CompareState(base_id=act_id, comp_id=s['id'])
+                                st.rerun()
 
-                if cmp_state and cmp_state["base_id"]==act:
-                    comp=idx_map.get(cmp_state["comp_id"])
-                    if comp:
-                        hA,hB=highlight_common(row.Texto,comp["Texto"])
-                        st.markdown("---"); colA,colB=st.columns(2)
-                        colA.markdown(hA,unsafe_allow_html=True); colB.markdown(hB,unsafe_allow_html=True)
-                        if st.button("❌ Fechar comparação",key=f"cls_{act}_{page}"):
-                            st.session_state[f"cmp{SUFFIX}"]=None; st.rerun()
+                # --- LÓGICA DE COMPARAÇÃO VISUAL ---
+                if cmp_state and cmp_state.base_id == act_id:
+                    comp_data = idx_map.get(cmp_state.comp_id)
+                    if comp_data:
+                        st.markdown("---")
+                        # (ALTERADO) Usa a nova função highlight_diffs
+                        hA, hB = highlight_diffs(row.Texto, comp_data["Texto"])
+                        
+                        colA, colB = st.columns(2)
+                        with colA:
+                            st.markdown(f"**ID Original: {act_id}**", unsafe_allow_html=True)
+                            st.markdown(hA, unsafe_allow_html=True)
+                        with colB:
+                            st.markdown(f"**Comparado com ID: {cmp_state.comp_id} ({s['ratio']:.0%})**", unsafe_allow_html=True)
+                            st.markdown(hB, unsafe_allow_html=True)
+                        
+                        if st.button("❌ Fechar Comparação", key=f"cls_{act_id}_{cmp_state.comp_id}"):
+                            st.session_state[SK.COMPARE_STATE] = None
+                            st.rerun()
+                
+                st.markdown("---")
 
-    if st.session_state[f"show_text{SUFFIX}"]: dlg_full()
 
-# ═════════════ LOGIN ═════════════
-def cred_ok(u,p): return str(st.secrets["credentials"]["usernames"].get(u,""))==p
+    if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]:
+        show_full_text_dialog()
+
+
+# ═════════════ TELA DE LOGIN ═════════════
+
 def login():
     st.header("Login")
     with st.form("login_form_main"):
-        u=st.text_input("Usuário"); p=st.text_input("Senha",type="password")
+        u = st.text_input("Usuário")
+        p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            if cred_ok(u,p):
-                st.session_state.update({"logged_in":True,"username":u}); st.rerun()
-            else: st.error("Credenciais inválidas.")
+            # Acesso seguro às credenciais
+            creds = st.secrets.get("credentials", {})
+            users = creds.get("usernames", {})
+            if u in users and str(users[u]) == p:
+                st.session_state[SK.LOGGED_IN] = True
+                st.session_state[SK.USERNAME] = u
+                st.rerun()
+            else:
+                st.error("Credenciais inválidas.")
 
-# ═════════════ MAIN ═════════════
-if __name__=="__main__":
-    if not st.session_state.get("logged_in"): st.session_state["logged_in"]=False
-    (app() if st.session_state["logged_in"] else login())
+# ═════════════ PONTO DE ENTRADA ═════════════
+
+if __name__ == "__main__":
+    init_session_state()
+    if st.session_state.get(SK.LOGGED_IN):
+        app()
+    else:
+        login()
