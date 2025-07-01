@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# VERSÃO FINAL COM A CORREÇÃO SUGERIDA PELO USUÁRIO
 import streamlit as st
 import pandas as pd
 import re, html, os, logging
@@ -33,6 +34,7 @@ class CompareState:
     comp_id: int
 
 st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
+# CSS ATUALIZADO COM AS CLASSES .del E .ins
 st.markdown("""
 <style>
     pre.highlighted-text {
@@ -51,11 +53,11 @@ st.markdown("""
         padding: 3px 6px; border-radius: 5px; color: black; font-weight: 500;
         display: inline-block; margin-bottom: 4px;
     }
-    .highlighted-text del {
+    .highlighted-text .del {
         background-color: #ffcdd2; /* Vermelho claro */
         text-decoration: none;
     }
-    .highlighted-text ins {
+    .highlighted-text .ins {
         background-color: #c8e6c9; /* Verde claro */
         text-decoration: none;
     }
@@ -83,16 +85,10 @@ def calc_sim(a: str, b: str) -> float:
 def cor_sim(r: float) -> str:
     return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
-# (VERSÃO FINAL E DEFINITIVA DA FUNÇÃO)
+# FUNÇÃO ATUALIZADA USANDO <span class='del'> E <span class='ins'>
 def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
-    """
-    Compara dois textos e destaca as diferenças (adições/remoções)
-    usando uma tokenização granular que preserva palavras e pontuações.
-    """
     t1, t2 = (t1 or ""), (t2 or "")
     
-    # Tokeniza em qualquer caractere não-alfanumérico (\W+), mantendo os delimitadores.
-    # Isso separa palavras, espaços e pontuações de forma eficaz.
     t1_tokens = [token for token in re.split(r'(\W+)', t1) if token]
     t2_tokens = [token for token in re.split(r'(\W+)', t2) if token]
 
@@ -107,12 +103,12 @@ def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
             out1.append(slice1)
             out2.append(slice2)
         elif tag == 'replace':
-            out1.append(f"<del>{slice1}</del>")
-            out2.append(f"<ins>{slice2}</ins>")
+            out1.append(f"<span class='del'>{slice1}</span>")
+            out2.append(f"<span class='ins'>{slice2}</span>")
         elif tag == 'delete':
-            out1.append(f"<del>{slice1}</del>")
+            out1.append(f"<span class='del'>{slice1}</span>")
         elif tag == 'insert':
-            out2.append(f"<ins>{slice2}</ins>")
+            out2.append(f"<span class='ins'>{slice2}</span>")
             
     h1 = f"<pre class='highlighted-text'>{''.join(out1)}</pre>"
     h2 = f"<pre class='highlighted-text'>{''.join(out2)}</pre>"
@@ -133,7 +129,6 @@ def db_engine() -> Engine | None:
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar(eng: Engine) -> pd.DataFrame:
-    # A data do WHERE foi ajustada para um período maior para garantir que os dados de exemplo sejam carregados
     lim=date.today()-timedelta(days=90) 
     q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
                    activity_date,activity_status,Texto
@@ -160,7 +155,7 @@ def carregar(eng: Engine) -> pd.DataFrame:
         logging.exception(e); st.error("Erro SQL"); return pd.DataFrame()
 
 
-# ═════════════ LÓGICA DO APP (Inalterado na maior parte) ═════════════
+# ═════════════ LÓGICA DO APP (Sem o modo de diagnóstico) ═════════════
 def sim_cache(df: pd.DataFrame, min_sim: float):
     sig = (tuple(sorted(df["activity_id"])), min_sim)
     cached = st.session_state.get(SK.SIM_CACHE)
@@ -228,7 +223,6 @@ def app():
 
     st.sidebar.header("Filtros")
     hoje = date.today()
-    # Intervalo de datas padrão ajustado para garantir que os exemplos apareçam
     d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=40))
     d_fim = st.sidebar.date_input("Fim", hoje + timedelta(days=14), min_value=d_ini)
     if d_ini > d_fim:
