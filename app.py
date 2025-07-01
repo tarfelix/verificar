@@ -8,8 +8,8 @@ from sqlalchemy import create_engine, text, exc
 from sqlalchemy.engine import Engine
 from unidecode import unidecode
 from rapidfuzz import fuzz
-from difflib import SequenceMatcher # (NOVO) Biblioteca para comparar sequências
-from dataclasses import dataclass # (NOVO) Para um estado de comparação mais limpo
+from difflib import SequenceMatcher
+from dataclasses import dataclass
 
 # ═════════════════ CONFIGURAÇÕES GLOBAIS ═════════════════
 
@@ -17,7 +17,6 @@ ITENS_POR_PAGINA = 20
 TZ_SP = ZoneInfo("America/Sao_Paulo")
 TZ_UTC = ZoneInfo("UTC")
 
-# (NOVO) Centralizando as chaves do session_state para evitar erros de digitação
 class SK:
     LOGGED_IN = "logged_in"
     USERNAME = "username"
@@ -28,13 +27,11 @@ class SK:
     FULL_TEXT_DATA = "full_text_data"
     COMPARE_STATE = "compare_state"
 
-# (NOVO) Dataclass para o estado de comparação, mais claro que um dicionário
 @dataclass
 class CompareState:
     base_id: int
     comp_id: int
 
-# (ALTERADO) CSS agora inclui estilos para inserções (ins) e deleções (del)
 st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
 st.markdown("""
 <style>
@@ -47,20 +44,19 @@ st.markdown("""
         border: 1px solid #ddd;
         border-radius: 5px;
         background-color: #f9f9f9;
-        height: 300px; /* Altura fixa para alinhar os botões */
-        overflow-y: auto; /* Adiciona scroll se o texto for muito grande */
+        height: 350px; 
+        overflow-y: auto;
     }
     .similarity-badge {
         padding: 3px 6px; border-radius: 5px; color: black; font-weight: 500;
         display: inline-block; margin-bottom: 4px;
     }
-    /* (NOVO) Estilos para o "diff" visual */
     .highlighted-text del {
-        background-color: #ffcdd2; /* Vermelho claro para texto removido */
-        text-decoration: line-through;
+        background-color: #ffcdd2; 
+        text-decoration: none;
     }
     .highlighted-text ins {
-        background-color: #c8e6c9; /* Verde claro para texto adicionado */
+        background-color: #c8e6c9; 
         text-decoration: none;
     }
 </style>
@@ -87,34 +83,31 @@ def calc_sim(a: str, b: str) -> float:
 def cor_sim(r: float) -> str:
     return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
-# (ALTERADO) Nova função de realce usando difflib para mostrar diferenças
 def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
     t1, t2 = (t1 or ""), (t2 or "")
-    sm = SequenceMatcher(None, t1, t2)
+    sm = SequenceMatcher(None, t1.split(), t2.split(), autojunk=False) # Comparando por palavras
     
     out1, out2 = [], []
+    t1_words, t2_words = t1.split(), t2.split()
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
-            out1.append(html.escape(t1[i1:i2]))
-            out2.append(html.escape(t2[j1:j2]))
-        elif tag == 'replace':
-            out1.append(f"<del>{html.escape(t1[i1:i2])}</del>")
-            out2.append(f"<ins>{html.escape(t2[j1:j2])}</ins>")
-        elif tag == 'delete':
-            out1.append(f"<del>{html.escape(t1[i1:i2])}</del>")
-        elif tag == 'insert':
-            out2.append(f"<ins>{html.escape(t2[j1:j2])}</ins>")
-
-    h1 = f"<pre class='highlighted-text'>{''.join(out1)}</pre>"
-    h2 = f"<pre class='highlighted-text'>{''.join(out2)}</pre>"
+            out1.append(" ".join(t1_words[i1:i2]))
+            out2.append(" ".join(t2_words[j1:j2]))
+        else:
+            if tag in ('replace', 'delete'):
+                out1.append(f"<del>{html.escape(' '.join(t1_words[i1:i2]))}</del>")
+            if tag in ('replace', 'insert'):
+                out2.append(f"<ins>{html.escape(' '.join(t2_words[j1:j2]))}</ins>")
+    
+    h1 = f"<pre class='highlighted-text'>{' '.join(out1)}</pre>"
+    h2 = f"<pre class='highlighted-text'>{' '.join(out2)}</pre>"
     return h1, h2
 
 # ═════════════ BANCO DE DADOS ═════════════
 
 @st.cache_resource
 def db_engine() -> Engine | None:
-    # ... (código do banco de dados inalterado)
     cfg=st.secrets.get("database",{})
     host,user,pw,db=[cfg.get(k) or os.getenv(f"DB_{k.upper()}") for k in["host","user","password","name"]]
     if not all([host,user,pw,db]): st.error("Credenciais de banco ausentes."); return None
@@ -127,7 +120,6 @@ def db_engine() -> Engine | None:
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar(eng: Engine) -> pd.DataFrame:
-    # ... (código de carregamento inalterado)
     lim=date.today()-timedelta(days=7)
     q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
                    activity_date,activity_status,Texto
@@ -157,7 +149,6 @@ def carregar(eng: Engine) -> pd.DataFrame:
 # ═════════════ CACHE DE SIMILARIDADE ═════════════
 
 def sim_cache(df: pd.DataFrame, min_sim: float):
-    # (ALTERADO) Usa a chave centralizada do SK
     sig = (tuple(sorted(df["activity_id"])), min_sim)
     cached = st.session_state.get(SK.SIM_CACHE)
     if cached and cached.get("sig") == sig:
@@ -245,7 +236,7 @@ def app():
     # --- FILTROS DA SIDEBAR ---
     st.sidebar.header("Filtros")
     hoje = date.today()
-    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=1))
+    d_ini = st.sidebar.date_input("Início", hoje - timedelta(days=7))
     d_fim = st.sidebar.date_input("Fim", hoje + timedelta(days=14), min_value=d_ini)
     if d_ini > d_fim:
         st.sidebar.error("Data de início não pode ser maior que a data de fim.")
@@ -329,7 +320,7 @@ def app():
                     sims = sim_map.get(act_id, [])
                     if sims:
                         st.markdown(f"**Duplicatas Encontradas:** {len(sims)}")
-                        for s in sims[:5]: # Limita a exibição para não poluir a tela
+                        for s in sims[:5]:
                             info = idx_map.get(s["id"])
                             if not info: continue
                             
@@ -351,23 +342,28 @@ def app():
                 if cmp_state and cmp_state.base_id == act_id:
                     comp_data = idx_map.get(cmp_state.comp_id)
                     if comp_data:
+                        # (CORREÇÃO) Busca a informação de similaridade novamente para garantir que está no escopo correto.
+                        sim_info = next((sim for sim in sim_map.get(act_id, []) if sim['id'] == cmp_state.comp_id), None)
+                        ratio_str = f"{sim_info['ratio']:.0%}" if sim_info else "N/A"
+
                         st.markdown("---")
-                        # (ALTERADO) Usa a nova função highlight_diffs
+                        # Usa a função de diff para obter os textos com realce
                         hA, hB = highlight_diffs(row.Texto, comp_data["Texto"])
                         
                         colA, colB = st.columns(2)
                         with colA:
-                            st.markdown(f"**ID Original: {act_id}**", unsafe_allow_html=True)
+                            st.markdown(f"**Original: ID {act_id}**")
                             st.markdown(hA, unsafe_allow_html=True)
                         with colB:
-                            st.markdown(f"**Comparado com ID: {cmp_state.comp_id} ({s['ratio']:.0%})**", unsafe_allow_html=True)
+                            # (CORREÇÃO) Usa a variável 'ratio_str' que acabamos de buscar.
+                            st.markdown(f"**Comparado: ID {cmp_state.comp_id} ({ratio_str})**")
                             st.markdown(hB, unsafe_allow_html=True)
                         
                         if st.button("❌ Fechar Comparação", key=f"cls_{act_id}_{cmp_state.comp_id}"):
                             st.session_state[SK.COMPARE_STATE] = None
                             st.rerun()
-                
-                st.markdown("---")
+
+                st.divider()
 
 
     if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]:
@@ -382,7 +378,6 @@ def login():
         u = st.text_input("Usuário")
         p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            # Acesso seguro às credenciais
             creds = st.secrets.get("credentials", {})
             users = creds.get("usernames", {})
             if u in users and str(users[u]) == p:
