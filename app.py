@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# VERSÃO FINAL COM A CORREÇÃO DEFINITIVA DE CSS SUGERIDA PELO USUÁRIO
 import streamlit as st
 import pandas as pd
 import re, html, os, logging
@@ -33,6 +34,7 @@ class CompareState:
     comp_id: int
 
 st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
+# (CSS CORRIGIDO) Usando classes específicas e !important para garantir a prioridade
 st.markdown("""
 <style>
     pre.highlighted-text {
@@ -51,16 +53,13 @@ st.markdown("""
         padding: 3px 6px; border-radius: 5px; color: black; font-weight: 500;
         display: inline-block; margin-bottom: 4px;
     }
-    /* força cor em del/ins */
-    pre.highlighted-text del, pre.highlighted-text ins {
-        padding: 1px 3px;
+    .diff-del {
+        background-color: #ffcdd2 !important;  /* vermelho claro */
         text-decoration: none !important;
     }
-    pre.highlighted-text del {
-        background-color: #ffcdd2 !important;  /* vermelho claro */
-    }
-    pre.highlighted-text ins {
+    .diff-ins {
         background-color: #c8e6c9 !important;  /* verde claro */
+        text-decoration: none !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -86,11 +85,13 @@ def calc_sim(a: str, b: str) -> float:
 def cor_sim(r: float) -> str:
     return "#FF5252" if r >= 0.9 else "#FFB74D" if r >= 0.7 else "#FFD54F"
 
-# ─────────── FUNÇÃO highlight_diffs ───────────
+# (FUNÇÃO CORRIGIDA) Usando <span class='diff-del'> e <span class='diff-ins'>
 def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
     t1, t2 = (t1 or ""), (t2 or "")
+    
     t1_tokens = [token for token in re.split(r'(\W+)', t1) if token]
     t2_tokens = [token for token in re.split(r'(\W+)', t2) if token]
+
     sm = SequenceMatcher(None, t1_tokens, t2_tokens, autojunk=False)
 
     out1, out2 = [], []
@@ -102,28 +103,25 @@ def highlight_diffs(t1: str, t2: str) -> tuple[str, str]:
             out1.append(slice1)
             out2.append(slice2)
         elif tag == 'replace':
-            out1.append(f"<del>{slice1}</del>")
-            out2.append(f"<ins>{slice2}</ins>")
+            out1.append(f"<span class='diff-del'>{slice1}</span>")
+            out2.append(f"<span class='diff-ins'>{slice2}</span>")
         elif tag == 'delete':
-            out1.append(f"<del>{slice1}</del>")
+            out1.append(f"<span class='diff-del'>{slice1}</span>")
         elif tag == 'insert':
-            out2.append(f"<ins>{slice2}</ins>")
+            out2.append(f"<span class='diff-ins'>{slice2}</span>")
             
     h1 = f"<pre class='highlighted-text'>{''.join(out1)}</pre>"
     h2 = f"<pre class='highlighted-text'>{''.join(out2)}</pre>"
     return h1, h2
 
-# ═════════════ BANCO DE DADOS ═════════════
-
+# ═════════════ BANCO DE DADOS (Inalterado) ═════════════
 @st.cache_resource
 def db_engine() -> Engine | None:
-    cfg = st.secrets.get("database", {})
-    host, user, pw, db = [cfg.get(k) or os.getenv(f"DB_{k.upper()}") for k in ["host","user","password","name"]]
-    if not all([host, user, pw, db]):
-        st.error("Credenciais de banco ausentes."); return None
+    cfg=st.secrets.get("database",{})
+    host,user,pw,db=[cfg.get(k) or os.getenv(f"DB_{k.upper()}") for k in["host","user","password","name"]]
+    if not all([host,user,pw,db]): st.error("Credenciais de banco ausentes."); return None
     try:
-        eng = create_engine(f"mysql+mysqlconnector://{user}:{pw}@{host}/{db}",
-                             pool_pre_ping=True, pool_recycle=3600)
+        eng=create_engine(f"mysql+mysqlconnector://{user}:{pw}@{host}/{db}",pool_pre_ping=True,pool_recycle=3600)
         with eng.connect(): pass
         return eng
     except exc.SQLAlchemyError as e:
@@ -131,37 +129,33 @@ def db_engine() -> Engine | None:
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar(eng: Engine) -> pd.DataFrame:
-    lim = date.today() - timedelta(days=90)
-    q_open = text("""SELECT activity_id,activity_folder,user_profile_name,
-                     activity_date,activity_status,Texto
-                     FROM ViewGrdAtividadesTarcisio
-                     WHERE activity_type='Verificar' AND activity_status='Aberta'""")
-    q_hist = text("""SELECT activity_id,activity_folder,user_profile_name,
-                     activity_date,activity_status,Texto
-                     FROM ViewGrdAtividadesTarcisio
-                     WHERE activity_type='Verificar' AND DATE(activity_date)>=:lim""")
+    lim=date.today()-timedelta(days=90) 
+    q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
+                   activity_date,activity_status,Texto
+                   FROM ViewGrdAtividadesTarcisio
+                   WHERE activity_type='Verificar' AND activity_status='Aberta'""")
+    q_hist=text("""SELECT activity_id,activity_folder,user_profile_name,
+                   activity_date,activity_status,Texto
+                   FROM ViewGrdAtividadesTarcisio
+                   WHERE activity_type='Verificar' AND DATE(activity_date)>=:lim""")
     try:
         with eng.connect() as c:
-            df = pd.concat([
-                pd.read_sql(q_open, c),
-                pd.read_sql(q_hist, c, params={"lim": lim})
-            ], ignore_index=True)
+            df=pd.concat([pd.read_sql(q_open,c),
+                          pd.read_sql(q_hist,c,params={"lim":lim})],ignore_index=True)
         if df.empty: return df
-        df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
-        df["Texto"] = df["Texto"].astype(str).fillna("")
-        df["status_ord"] = df["activity_status"].map({"Aberta":0}).fillna(1)
-        df = (df.sort_values(["activity_id","status_ord"])
+        df["activity_date"]=pd.to_datetime(df["activity_date"],errors="coerce")
+        df["Texto"]=df["Texto"].astype(str).fillna("")
+        df["status_ord"]=df["activity_status"].map({"Aberta":0}).fillna(1)
+        df=(df.sort_values(["activity_id","status_ord"])
                 .drop(columns="status_ord")
                 .drop_duplicates("activity_id"))
-        return df.sort_values(
-            ["activity_folder","activity_date","activity_id"],
-            ascending=[True,False,False]
-        )
+        return df.sort_values(["activity_folder","activity_date","activity_id"],
+                              ascending=[True,False,False])
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro SQL"); return pd.DataFrame()
 
-# ═════════════ LÓGICA DO APP ═════════════
 
+# ═════════════ LÓGICA DO APP (Inalterado) ═════════════
 def sim_cache(df: pd.DataFrame, min_sim: float):
     sig = (tuple(sorted(df["activity_id"])), min_sim)
     cached = st.session_state.get(SK.SIM_CACHE)
@@ -223,7 +217,7 @@ def app():
     df = carregar(eng)
     if df.empty:
         st.warning("Nenhuma atividade encontrada para análise."); st.stop()
-
+    
     up = st.session_state.get(SK.LAST_UPDATE) or datetime.now(TZ_SP)
     st.sidebar.caption(f"Dados de {up:%d/%m/%Y %H:%M:%S}")
 
@@ -235,6 +229,7 @@ def app():
         st.sidebar.error("Data de início não pode ser maior que a data de fim."); st.stop()
 
     df_per = df[df["activity_date"].notna() & df["activity_date"].dt.date.between(d_ini, d_fim)]
+    
     pastas_sel = st.sidebar.multiselect("Pastas p/ Análise", sorted(df_per["activity_folder"].dropna().unique()))
     df_ana = df_per if not pastas_sel else df_per[df_per["activity_folder"].isin(pastas_sel)]
 
@@ -243,8 +238,9 @@ def app():
     only_dup = st.sidebar.checkbox("Mostrar somente duplicatas", True)
     only_multi = st.sidebar.checkbox("Apenas pastas com múltiplos responsáveis")
     users_sel = st.sidebar.multiselect("Usuários", sorted(df_ana["user_profile_name"].dropna().unique()))
-
+    
     sim_map, dup_ids = sim_cache(df_ana, min_sim)
+
     df_view = df_ana.copy()
     if status_sel: df_view = df_view[df_view["activity_status"].isin(status_sel)]
     if only_dup: df_view = df_view[df_view["activity_id"].isin(dup_ids)]
@@ -252,11 +248,12 @@ def app():
         mult = {p for p, g in df_ana.groupby("activity_folder") if g["user_profile_name"].nunique() > 1}
         df_view = df_view[df_view["activity_folder"].isin(mult)]
     if users_sel: df_view = df_view[df_view["user_profile_name"].isin(users_sel)]
-
+    
     st.title(f"🔎 Análise de Duplicidades ({len(df_view)} atividades exibidas)")
+    
     idx_map = df_ana.set_index("activity_id").to_dict("index")
     pastas_ord = sorted(df_view["activity_folder"].dropna().unique())
-
+    
     if not pastas_ord:
         st.info("Nenhum resultado para os filtros selecionados."); st.stop()
 
@@ -264,7 +261,7 @@ def app():
     page_num = st.session_state.get(SK.PAGE, 0)
     page_num = max(0, min(page_num, total_paginas - 1))
     st.session_state[SK.PAGE] = page_num
-
+    
     if total_paginas > 1:
         l, mid, r = st.columns([1, 2, 1])
         if l.button("⬅", disabled=page_num == 0): st.session_state[SK.PAGE] -= 1; st.rerun()
@@ -272,10 +269,14 @@ def app():
         if r.button("➡", disabled=page_num == total_paginas - 1): st.session_state[SK.PAGE] += 1; st.rerun()
 
     cmp_state = st.session_state.get(SK.COMPARE_STATE)
-    for pasta in pastas_ord[page_num * ITENS_POR_PAGINA:(page_num + 1) * ITENS_POR_PAGINA]:
+    pastas_na_pagina = pastas_ord[page_num * ITENS_POR_PAGINA : (page_num + 1) * ITENS_POR_PAGINA]
+
+    for pasta in pastas_na_pagina:
         df_p = df_view[df_view["activity_folder"] == pasta]
         total_na_pasta_analisada = len(df_ana[df_ana["activity_folder"] == pasta])
-        with st.expander(f"📁 {pasta} ({len(df_p)} de {total_na_pasta_analisada})"):
+        exp_title = f"📁 {pasta} ({len(df_p)} de {total_na_pasta_analisada} na análise)"
+        
+        with st.expander(exp_title, expanded=True):
             for row in df_p.itertuples(index=False):
                 act_id = row.activity_id
                 c1, c2 = st.columns([.6, .4], gap="large")
@@ -284,13 +285,14 @@ def app():
                     dt = as_sp(row.activity_date)
                     st.markdown(f"**ID:** {act_id}  •  **Status:** {row.activity_status}  •  **Data:** {dt.strftime('%d/%m/%y %H:%M') if dt else 'N/A'}")
                     st.markdown(f"**Usuário:** {row.user_profile_name}")
+                    
                     b1, b2, b3 = st.columns(3)
                     if b1.button("👁 Texto Completo", key=f"full_{act_id}"):
                         st.session_state[SK.FULL_TEXT_DATA] = row._asdict()
                         st.session_state[SK.SHOW_FULL_TEXT_DIALOG] = True
-                    link_z1 = f"https://zflow.zionbyonset.com.br/activity/3/details/{act_id}"
-                    link_z2 = f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={act_id}#/fixcol1"
-                    b2.link_button("ZFlow v1", link_z1); b3.link_button("ZFlow v2", link_z2)
+                    link_zflow_v1 = f"https://zflow.zionbyonset.com.br/activity/3/details/{act_id}"
+                    link_zflow_v2 = f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={act_id}#/fixcol1"
+                    b2.link_button("ZFlow v1", link_zflow_v1); b3.link_button("ZFlow v2", link_zflow_v2)
 
                 with c2:
                     sims = sim_map.get(act_id, [])
@@ -301,66 +303,55 @@ def app():
                             if not info: continue
                             d = as_sp(info["activity_date"])
                             d_fmt = d.strftime("%d/%m/%y %H:%M") if d else "N/A"
-                            badge = (
+                            badge_html = (
                                 f"<div class='similarity-badge' style='background:{s['cor']};'>"
                                 f"<b>ID {s['id']}</b> • {s['ratio']:.0%}<br>"
                                 f"{d_fmt} • {info['user_profile_name']}"
-                                "</div>"
-                            )
-                            st.markdown(badge, unsafe_allow_html=True)
+                                "</div>")
+                            st.markdown(badge_html, unsafe_allow_html=True)
                             if st.button("⚖️ Comparar", key=f"cmp_{act_id}_{s['id']}"):
-                                st.session_state[SK.COMPARE_STATE] = CompareState(act_id, s['id'])
+                                st.session_state[SK.COMPARE_STATE] = CompareState(base_id=act_id, comp_id=s['id'])
                                 st.rerun()
 
                 if cmp_state and cmp_state.base_id == act_id:
-                    comp = idx_map.get(cmp_state.comp_id)
-                    if comp:
-                        sim_info = next((x for x in sim_map.get(act_id, []) if x['id'] == cmp_state.comp_id), None)
-                        ratio = f"{sim_info['ratio']:.0%}" if sim_info else ""
+                    comp_data = idx_map.get(cmp_state.comp_id)
+                    if comp_data:
+                        sim_info = next((s for s in sim_map.get(act_id, []) if s['id'] == cmp_state.comp_id), None)
+                        ratio_str = f"{sim_info['ratio']:.0%}" if sim_info else "N/A"
                         st.markdown("---")
+                        
                         st.markdown("""
-<div style="font-size:0.85em;margin-bottom:10px;padding:5px;background:#f0f2f6;border-radius:5px;">
-  <b>Legenda:</b>
-  <span style="background:#ffcdd2;padding:0 3px;margin:0 5px;">Removido</span>|
-  <span style="background:#c8e6c9;padding:0 3px;margin:0 5px;">Inserido</span>
-</div>
+                        <div style="font-size: 0.85em; margin-bottom: 10px; padding: 5px; background-color: #f0f2f6; border-radius: 5px;">
+                            <b>Legenda:</b>
+                            <span style="padding: 0 3px; margin: 0 5px; background-color: #ffcdd2;">Texto removido do original</span> |
+                            <span style="padding: 0 3px; margin: 0 5px; background-color: #c8e6c9;">Texto adicionado no comparado</span>
+                        </div>
                         """, unsafe_allow_html=True)
-
-                        h1, h2 = highlight_diffs(row.Texto, comp["Texto"])
+                        
+                        hA, hB = highlight_diffs(row.Texto, comp_data["Texto"])
+                        
                         colA, colB = st.columns(2)
                         with colA:
-                            st.markdown(f"**Original ID {act_id}**")
-                            st.markdown(h1, unsafe_allow_html=True)
+                            st.markdown(f"**Original: ID {act_id}**"); st.markdown(hA, unsafe_allow_html=True)
                         with colB:
-                            st.markdown(f"**Comparado ID {cmp_state.comp_id} ({ratio})**")
-                            st.markdown(h2, unsafe_allow_html=True)
-
+                            st.markdown(f"**Comparado: ID {cmp_state.comp_id} ({ratio_str})**"); st.markdown(hB, unsafe_allow_html=True)
+                        
                         if st.button("❌ Fechar Comparação", key=f"cls_{act_id}_{cmp_state.comp_id}"):
-                            st.session_state[SK.COMPARE_STATE] = None
-                            st.rerun()
-
+                            st.session_state[SK.COMPARE_STATE] = None; st.rerun()
                 st.divider()
 
-    if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]:
-        show_full_text_dialog()
+    if st.session_state[SK.SHOW_FULL_TEXT_DIALOG]: show_full_text_dialog()
 
 def login():
     st.header("Login")
     with st.form("login_form_main"):
-        u = st.text_input("Usuário")
-        p = st.text_input("Senha", type="password")
+        u = st.text_input("Usuário"); p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            creds = st.secrets.get("credentials", {}).get("usernames", {})
-            if u in creds and str(creds[u]) == p:
-                st.session_state[SK.LOGGED_IN] = True
-                st.session_state[SK.USERNAME] = u
-                st.rerun()
-            else:
-                st.error("Credenciais inválidas.")
+            creds = st.secrets.get("credentials", {}); users = creds.get("usernames", {})
+            if u in users and str(users[u]) == p:
+                st.session_state[SK.LOGGED_IN] = True; st.session_state[SK.USERNAME] = u; st.rerun()
+            else: st.error("Credenciais inválidas.")
 
 if __name__ == "__main__":
     init_session_state()
-    if st.session_state[SK.LOGGED_IN]:
-        app()
-    else:
-        login()
+    (app() if st.session_state.get(SK.LOGGED_IN) else login())
