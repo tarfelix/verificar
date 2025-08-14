@@ -129,6 +129,14 @@ def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
             out2.append(f"<span class='diff-ins'>{slice2}</span>")
     return (f"<pre class='highlighted-text'>{''.join(out1)}</pre>", f"<pre class='highlighted-text'>{''.join(out2)}</pre>")
 
+# [CORREÇÃO] A função link_z foi adicionada de volta.
+def link_z(activity_id: str) -> dict:
+    """Gera os links para as versões v1 e v2 do ZFlow."""
+    return {
+        "antigo": f"https://zflow.zionbyonset.com.br/activity/3/details/{activity_id}",
+        "novo": f"https://zflowv2.zionbyonset.com.br/public/versatile_frame.php/?moduloid=2&activityid={activity_id}#/fixcol1"
+    }
+
 # ==============================================================================
 # 4. LÓGICA DE DADOS (BANCO DE DADOS E CACHE)
 # ==============================================================================
@@ -395,7 +403,9 @@ def renderizar_cartao_atividade(row, pasta, sim_map, idx_map, max_selecoes, num_
         st.text_area("Texto", row.Texto, height=100, disabled=True, key=f"txt_{pasta}_{act_id}")
         b1, b2, b3 = st.columns(3)
         b1.button("👁 Completo", key=f"full_{act_id}", on_click=lambda r=row: st.session_state.update({SK.FULL_TEXT_DATA: r._asdict(), SK.SHOW_FULL_TEXT_DIALOG: True}))
-        links = link_z(act_id); b2.link_button("ZFlow v1", links["antigo"]); b3.link_button("ZFlow v2", links["novo"])
+        links = link_z(act_id)
+        b2.link_button("ZFlow v1", links["antigo"])
+        b3.link_button("ZFlow v2", links["novo"])
     with c2:
         similares = sim_map.get(act_id, [])
         if similares:
