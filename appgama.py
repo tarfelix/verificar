@@ -17,7 +17,7 @@ from difflib import SequenceMatcher
 
 # --- Constantes da Aplicação ---
 ITENS_POR_PAGINA = 20
-DIAS_HISTORICO_COMPARACAO = 90
+DIAS_HISTORICO_COMPARACAO = 7
 DIAS_FILTRO_PADRAO_INICIO = 7
 DIAS_FILTRO_PADRAO_FIM = 14
 SUFFIX = "_v9_refatorado" # Sufixo para evitar conflitos de cache/sessão com versões antigas
