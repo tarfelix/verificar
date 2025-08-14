@@ -20,7 +20,7 @@ ITENS_POR_PAGINA = 20
 DIAS_HISTORICO_COMPARACAO = 90
 DIAS_FILTRO_PADRAO_INICIO = 7
 DIAS_FILTRO_PADRAO_FIM = 14
-SUFFIX = "_v10_performance" # Sufixo para evitar conflitos de cache/sessão com versões antigas
+SUFFIX = "_v11_stable" # Sufixo para evitar conflitos de cache/sessão com versões antigas
 
 # --- Zonas de Tempo ---
 TZ_SP  = ZoneInfo("America/Sao_Paulo")
@@ -346,7 +346,9 @@ def app():
     if filtros["only_dup"]:
         df_view = df_view[df_view["activity_id"].isin(dup_ids)]
 
-    idx_map_completo = df_base_comparacao.set_index("activity_id").to_dict("index")
+    # [CORREÇÃO] A forma de criar o mapa de lookup foi alterada para garantir que
+    # a chave 'activity_id' esteja presente nos dicionários de valores.
+    idx_map_completo = {str(rec['activity_id']): rec for rec in df_base_comparacao.to_dict('records')}
 
     c1, c2 = st.columns([6, 2])
     with c1:
@@ -420,10 +422,9 @@ def renderizar_cartao_atividade(row, pasta, sim_map, idx_map, max_selecoes, num_
     if comps_to_show: st.markdown("---")
     for comp_pair in comps_to_show:
         comp_id = next(c_id for c_id in comp_pair if c_id != act_id)
-        renderizar_visualizacao_comparacao(row, idx_map.get(comp_id), pasta, max_selecoes, num_selecionados, sim_map)
+        renderizar_visualizacao_comparacao(row, idx_map.get(str(comp_id)), pasta, max_selecoes, num_selecionados, sim_map)
 
 def renderizar_visualizacao_comparacao(base_data_row, comp_data_dict, pasta, max_sel, num_sel, sim_map):
-    # [CORREÇÃO] Adicionada verificação para evitar o erro.
     if not comp_data_dict: 
         return
         
