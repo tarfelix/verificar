@@ -26,7 +26,6 @@ class SK:
     GROUP_STATES = f"group_states_{SUFFIX}"
 
 ITENS_POR_PAGINA = 10
-# [CORREÇÃO] Adicionadas as constantes que estavam faltando.
 DIAS_FILTRO_PADRAO_INICIO = 7
 DIAS_FILTRO_PADRAO_FIM = 14
 TZ_SP  = ZoneInfo("America/Sao_Paulo")
@@ -190,12 +189,17 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
     st.sidebar.caption(f"Dados de: {up:%d/%m/%Y %H:%M}")
     
     st.sidebar.header("Filtros")
+    
+    # [CORREÇÃO] Garante que as opções estarão vazias se o dataframe estiver vazio na primeira renderização.
+    pastas_options = sorted(df_completo["activity_folder"].dropna().unique()) if not df_completo.empty else []
+    status_options = sorted(df_completo["activity_status"].dropna().unique()) if not df_completo.empty else []
+
     filtros = {
         "dias_historico": st.sidebar.number_input("Dias para Comparação", min_value=7, value=90, step=1),
         "data_inicio": st.sidebar.date_input("Data Início", date.today() - timedelta(days=DIAS_FILTRO_PADRAO_INICIO)),
         "data_fim": st.sidebar.date_input("Data Fim", date.today() + timedelta(days=DIAS_FILTRO_PADRAO_FIM)),
-        "pastas": st.sidebar.multiselect("Pastas", sorted(df_completo["activity_folder"].dropna().unique())),
-        "status": st.sidebar.multiselect("Status", sorted(df_completo["activity_status"].dropna().unique())),
+        "pastas": st.sidebar.multiselect("Pastas", pastas_options),
+        "status": st.sidebar.multiselect("Status", status_options),
         "min_sim": st.sidebar.slider("Similaridade Mínima (%)", 0, 100, 90, 1) / 100
     }
 
@@ -209,17 +213,13 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
     if saved_filters:
         selected_filter = st.sidebar.selectbox("Carregar Filtro Salvo", [""] + list(saved_filters.keys()))
         if selected_filter:
-            # Esta parte não recarrega a UI automaticamente, é uma limitação do Streamlit.
-            # O ideal é que o usuário clique em "Atualizar" após carregar.
             st.sidebar.info("Filtros carregados. Clique em 'Atualizar dados' para aplicar.")
-            # st.session_state.update(saved_filters[selected_filter]) # Isso não funciona bem com widgets
     return filtros
 
 def renderizar_grupo_duplicatas(group_data: list, group_index: int):
     """Renderiza um 'super card' para um grupo de atividades duplicadas."""
     group_id = group_data[0]['activity_id'] # Usa o ID do mais recente como ID do grupo
     
-    # Gerencia o estado do grupo (principal, cancelados, comparações abertas)
     group_state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
         "principal_id": group_data[0]['activity_id'],
         "cancelados": set(),
@@ -260,7 +260,6 @@ def renderizar_grupo_duplicatas(group_data: list, group_index: int):
             
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Renderiza a comparação se estiver aberta
         if group_state["comparacao_aberta"]:
             principal_data = next(item for item in group_data if item['activity_id'] == group_state["principal_id"])
             comparado_data = next(item for item in group_data if item['activity_id'] == group_state["comparacao_aberta"])
@@ -309,7 +308,6 @@ def app():
             st.success("Ações de cancelamento processadas!")
             st.rerun()
 
-        # Botão de Exportar
         if grupos_duplicados:
             export_data = []
             for i, group in enumerate(grupos_duplicados):
