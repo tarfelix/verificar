@@ -189,7 +189,7 @@ def db_engine() -> Engine | None:
 @st.cache_data(ttl=3600,hash_funcs={Engine:lambda _:None})
 def carregar(eng:Engine)->pd.DataFrame:
     # [ALTERAÇÃO] Aumentado o período de busca para 90 dias para criar uma base de comparação robusta.
-    lim=date.today()-timedelta(days=90)
+    lim=date.today()-timedelta(days=15)
     q_open=text("""SELECT activity_id,activity_folder,user_profile_name,
                    activity_date,activity_status,Texto
                    FROM ViewGrdAtividadesTarcisio
