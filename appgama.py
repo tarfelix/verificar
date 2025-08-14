@@ -20,7 +20,7 @@ ITENS_POR_PAGINA = 20
 DIAS_HISTORICO_COMPARACAO = 90
 DIAS_FILTRO_PADRAO_INICIO = 7
 DIAS_FILTRO_PADRAO_FIM = 14
-SUFFIX = "_v11_stable" # Sufixo para evitar conflitos de cache/sessão com versões antigas
+SUFFIX = "_v12_keyfix" # Sufixo para evitar conflitos de cache/sessão com versões antigas
 
 # --- Zonas de Tempo ---
 TZ_SP  = ZoneInfo("America/Sao_Paulo")
@@ -346,8 +346,6 @@ def app():
     if filtros["only_dup"]:
         df_view = df_view[df_view["activity_id"].isin(dup_ids)]
 
-    # [CORREÇÃO] A forma de criar o mapa de lookup foi alterada para garantir que
-    # a chave 'activity_id' esteja presente nos dicionários de valores.
     idx_map_completo = {str(rec['activity_id']): rec for rec in df_base_comparacao.to_dict('records')}
 
     c1, c2 = st.columns([6, 2])
@@ -418,10 +416,15 @@ def renderizar_cartao_atividade(row, pasta, sim_map, idx_map, max_selecoes, num_
                 st.button("⚖ Comparar", key=f"cmp_{act_id}_{info_id}", on_click=add_comp, args=(act_id, info_id))
 
     open_comps = st.session_state.get(SK.OPEN_COMPARISONS, set())
-    comps_to_show = [c for c in open_comps if act_id in c]
+    
+    # [CORREÇÃO] Apenas renderiza a comparação no cartão com o menor ID do par,
+    # para evitar a criação de widgets com chaves duplicadas.
+    comps_to_show = [c for c in open_comps if act_id == min(c)]
+
     if comps_to_show: st.markdown("---")
     for comp_pair in comps_to_show:
-        comp_id = next(c_id for c_id in comp_pair if c_id != act_id)
+        # O ID de comparação será sempre o maior ID do par.
+        comp_id = max(comp_pair)
         renderizar_visualizacao_comparacao(row, idx_map.get(str(comp_id)), pasta, max_selecoes, num_selecionados, sim_map)
 
 def renderizar_visualizacao_comparacao(base_data_row, comp_data_dict, pasta, max_sel, num_sel, sim_map):
