@@ -26,6 +26,9 @@ class SK:
     GROUP_STATES = f"group_states_{SUFFIX}"
 
 ITENS_POR_PAGINA = 10
+# [CORREÇÃO] Adicionadas as constantes que estavam faltando.
+DIAS_FILTRO_PADRAO_INICIO = 7
+DIAS_FILTRO_PADRAO_FIM = 14
 TZ_SP  = ZoneInfo("America/Sao_Paulo")
 TZ_UTC = ZoneInfo("UTC")
 
