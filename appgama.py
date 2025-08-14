@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 # ==============================================================================
 # 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
 # ==============================================================================
-SUFFIX = "_v14_features"
+SUFFIX = "_v16_review"
 
 class SK:
     LOGGED_IN = "logged_in"
@@ -99,7 +99,7 @@ def log_action(user: str, action: str, details: dict):
     log_entry = {"timestamp": datetime.now(TZ_SP), "user": user, "action": action, "details": details}
     st.session_state[SK.AUDIT_LOG].insert(0, log_entry)
 
-def df_to_csv(df: pd.DataFrame) -> str:
+def df_to_csv(df: pd.DataFrame) -> bytes:
     """Converte um DataFrame para uma string CSV para download."""
     return df.to_csv(index=False).encode('utf-8')
 
@@ -127,7 +127,7 @@ def carregar_dados(eng: Engine, dias_historico: int) -> pd.DataFrame:
         if df.empty: return pd.DataFrame()
         df["activity_id"] = df["activity_id"].astype(str)
         df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
-        df["Texto"] = df["Texto"].astype(str).fillna("")
+        df["Texto"] = df["Texto"].fillna("").astype(str)
         df["status_ord"] = df["activity_status"].map({"Aberta": 0}).fillna(1)
         df = df.sort_values(["activity_id", "status_ord"]).drop_duplicates("activity_id", keep="first").drop(columns="status_ord")
         return df.sort_values(["activity_folder", "activity_date"], ascending=[True, False])
@@ -135,43 +135,66 @@ def carregar_dados(eng: Engine, dias_historico: int) -> pd.DataFrame:
         logging.exception(e); st.error("Erro ao carregar dados."); return pd.DataFrame()
 
 def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
-    """Cria grupos de atividades duplicadas para exibição."""
+    """Agrupa duplicatas por componentes conexos (transitivo) dentro de cada pasta."""
     sig = (tuple(sorted(df["activity_id"])), min_sim)
     cached = st.session_state.get(SK.SIMILARITY_CACHE)
-    if cached and cached.get("sig") == sig: return cached["groups"]
+    if cached and cached.get("sig") == sig:
+        return cached["groups"]
+
+    if df.empty:
+        st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": []}
+        return []
 
     df = df.copy()
-    df['norm_texto'] = df['Texto'].apply(norm)
-    atividades = df.to_dict('records')
-    idx_map = {act['activity_id']: act for act in atividades}
-    
-    processed_ids = set()
-    groups = []
-    
-    bar = st.sidebar.progress(0, "Agrupando duplicatas...")
-    total_atividades = len(atividades)
-    for i, act1 in enumerate(atividades):
-        bar.progress((i + 1) / total_atividades, f"Analisando {i+1}/{total_atividades}")
-        if act1['activity_id'] in processed_ids: continue
-        
-        current_group = {act1['activity_id']}
-        
-        # Compara com todas as outras na mesma pasta
-        comparar_com = [act2 for act2 in atividades if act1['activity_folder'] == act2['activity_folder'] and act1['activity_id'] != act2['activity_id']]
-        
-        for act2 in comparar_com:
-            if act2['activity_id'] in processed_ids: continue
-            ratio = fuzz.token_set_ratio(act1['norm_texto'], act2['norm_texto']) / 100
-            if ratio >= min_sim:
-                current_group.add(act2['activity_id'])
-        
-        if len(current_group) > 1:
-            group_details = [idx_map[id] for id in current_group]
-            group_details.sort(key=lambda x: x['activity_date'], reverse=True)
-            groups.append(group_details)
-            processed_ids.update(current_group)
+    df["norm_texto"] = df["Texto"].apply(norm)
 
-    bar.empty()
+    groups = []
+    cutoff = int(min_sim * 100)
+
+    ph = st.sidebar.empty()
+    pb = ph.progress(0, text="Agrupando duplicatas...")
+
+    total_por_pasta = df.groupby("activity_folder", dropna=False).size().sum()
+    avan = 0
+    for folder, dff in df.groupby("activity_folder", dropna=False):
+        ids = dff["activity_id"].tolist()
+        texts = dff["norm_texto"].tolist()
+        n = len(ids)
+        if n < 2:
+            avan += n
+            pb.progress(min(100, int(100 * avan / max(1, total_por_pasta))), text=f"Agrupando… {avan}/{total_por_pasta}")
+            continue
+
+        sim = process.cdist(texts, texts, scorer=fuzz.token_set_ratio, score_cutoff=cutoff)
+
+        visitados = set()
+        for i in range(n):
+            if i in visitados:
+                avan += 1
+                pb.progress(min(100, int(100 * avan / max(1, total_por_pasta))), text=f"Agrupando… {avan}/{total_por_pasta}")
+                continue
+
+            comp = {i}
+            fila = [i]
+            visitados.add(i)
+            while fila:
+                k = fila.pop(0)
+                for j in range(n):
+                    if j not in visitados and sim[k][j] >= cutoff:
+                        visitados.add(j)
+                        comp.add(j)
+                        fila.append(j)
+            
+            avan += 1
+            pb.progress(min(100, int(100 * avan / max(1, total_por_pasta))), text=f"Agrupando… {avan}/{total_por_pasta}")
+
+            if len(comp) > 1:
+                comp_idxs = sorted(list(comp), key=lambda idx: dff.iloc[idx]["activity_date"], reverse=True)
+                group = [dff.iloc[idx].to_dict() for idx in comp_idxs]
+                groups.append(group)
+
+    ph.empty()
+
     st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
     return groups
 
@@ -179,25 +202,35 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
 # 5. COMPONENTES DE UI
 # ==============================================================================
 
-def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
+def renderizar_sidebar_primaria() -> dict:
+    """Renderiza os controles da sidebar que não dependem dos dados carregados."""
     st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
-    if st.sidebar.button("Logout"): st.session_state.clear(); st.rerun()
+    if st.sidebar.button("Logout"): 
+        st.session_state.clear()
+        st.rerun()
 
     if st.sidebar.button("🔄 Atualizar dados"):
-        st.session_state[SK.LAST_UPDATE] = datetime.now(TZ_SP); carregar_dados.clear(); st.session_state.pop(SK.SIMILARITY_CACHE, None)
+        st.session_state[SK.LAST_UPDATE] = datetime.now(TZ_SP)
+        carregar_dados.clear()
+        st.session_state.pop(SK.SIMILARITY_CACHE, None)
+    
     up = st.session_state.get(SK.LAST_UPDATE) or datetime.now(TZ_SP)
     st.sidebar.caption(f"Dados de: {up:%d/%m/%Y %H:%M}")
     
     st.sidebar.header("Filtros")
     
-    # [CORREÇÃO] Garante que as opções estarão vazias se o dataframe estiver vazio na primeira renderização.
-    pastas_options = sorted(df_completo["activity_folder"].dropna().unique()) if not df_completo.empty else []
-    status_options = sorted(df_completo["activity_status"].dropna().unique()) if not df_completo.empty else []
-
-    filtros = {
+    return {
         "dias_historico": st.sidebar.number_input("Dias para Comparação", min_value=7, value=90, step=1),
         "data_inicio": st.sidebar.date_input("Data Início", date.today() - timedelta(days=DIAS_FILTRO_PADRAO_INICIO)),
         "data_fim": st.sidebar.date_input("Data Fim", date.today() + timedelta(days=DIAS_FILTRO_PADRAO_FIM)),
+    }
+
+def renderizar_sidebar_secundaria(df_completo: pd.DataFrame, filtros_primarios: dict) -> dict:
+    """Renderiza os controles da sidebar que dependem dos dados carregados."""
+    pastas_options = sorted(df_completo["activity_folder"].dropna().unique())
+    status_options = sorted(df_completo["activity_status"].dropna().unique())
+
+    filtros_secundarios = {
         "pastas": st.sidebar.multiselect("Pastas", pastas_options),
         "status": st.sidebar.multiselect("Status", status_options),
         "min_sim": st.sidebar.slider("Similaridade Mínima (%)", 0, 100, 90, 1) / 100
@@ -207,18 +240,20 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
     saved_filters = st.session_state[SK.SAVED_FILTERS]
     filter_name = st.sidebar.text_input("Nome para salvar filtro")
     if st.sidebar.button("Salvar Filtros Atuais") and filter_name:
-        saved_filters[filter_name] = filtros
+        filtros_para_salvar = {**filtros_primarios, **filtros_secundarios}
+        saved_filters[filter_name] = filtros_para_salvar
         st.sidebar.success(f"Filtro '{filter_name}' salvo!")
     
     if saved_filters:
         selected_filter = st.sidebar.selectbox("Carregar Filtro Salvo", [""] + list(saved_filters.keys()))
         if selected_filter:
             st.sidebar.info("Filtros carregados. Clique em 'Atualizar dados' para aplicar.")
-    return filtros
+    
+    return filtros_secundarios
 
 def renderizar_grupo_duplicatas(group_data: list, group_index: int):
     """Renderiza um 'super card' para um grupo de atividades duplicadas."""
-    group_id = group_data[0]['activity_id'] # Usa o ID do mais recente como ID do grupo
+    group_id = group_data[0]['activity_id']
     
     group_state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
         "principal_id": group_data[0]['activity_id'],
@@ -281,11 +316,12 @@ def app():
     api_client = inicializar_api_client()
     eng = db_engine()
     
-    filtros = renderizar_sidebar(pd.DataFrame()) # Renderiza sidebar para pegar dias_historico
-    df_completo = carregar_dados(eng, filtros['dias_historico'])
+    filtros_primarios = renderizar_sidebar_primaria()
+    df_completo = carregar_dados(eng, filtros_primarios['dias_historico'])
     if df_completo.empty: st.warning("Nenhuma atividade encontrada."); st.stop()
     
-    filtros = renderizar_sidebar(df_completo) # Re-renderiza para popular multiselects
+    filtros_secundarios = renderizar_sidebar_secundaria(df_completo, filtros_primarios)
+    filtros = {**filtros_primarios, **filtros_secundarios}
 
     tab_principal, tab_log = st.tabs(["🔎 Análise de Duplicidades", "📜 Histórico de Ações"])
 
@@ -301,11 +337,28 @@ def app():
         header_c1.markdown(f"### {len(grupos_duplicados)} Grupos de Duplicatas Encontrados")
         
         if header_c2.button("Processar Cancelamentos"):
+            total = ok = fail = 0
+            erros = []
             for group_id, state in st.session_state[SK.GROUP_STATES].items():
-                for act_id in state['cancelados']:
-                    # Aqui iria a chamada à API
-                    log_action(st.session_state[SK.USERNAME], "Cancelamento", {"activity_id": act_id, "grupo": group_id})
-            st.success("Ações de cancelamento processadas!")
+                for act_id in list(state["cancelados"]):
+                    total += 1
+                    try:
+                        resp = api_client.activity_canceled(activity_id=int(act_id),
+                                                            user_name=st.session_state[SK.USERNAME])
+                        if resp is not None:
+                            ok += 1
+                            log_action(st.session_state[SK.USERNAME], "Cancelamento", {"activity_id": act_id, "grupo": group_id, "api_resp": resp})
+                        else:
+                            fail += 1
+                            erros.append(str(act_id))
+                    except Exception as e:
+                        fail += 1
+                        erros.append(f"{act_id} ({e})")
+
+            if ok:
+                st.success(f"{ok}/{total} cancelamento(s) enviados com sucesso.")
+            if fail:
+                st.error(f"{fail}/{total} falharam: {', '.join(erros[:10])}{'...' if len(erros) > 10 else ''}")
             st.rerun()
 
         if grupos_duplicados:
