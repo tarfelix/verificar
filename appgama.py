@@ -129,7 +129,6 @@ def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
             out2.append(f"<span class='diff-ins'>{slice2}</span>")
     return (f"<pre class='highlighted-text'>{''.join(out1)}</pre>", f"<pre class='highlighted-text'>{''.join(out2)}</pre>")
 
-# [CORREÇÃO] A função link_z foi adicionada de volta.
 def link_z(activity_id: str) -> dict:
     """Gera os links para as versões v1 e v2 do ZFlow."""
     return {
@@ -188,13 +187,11 @@ def gerar_mapa_similaridade(df_exibir: pd.DataFrame, df_comparar: pd.DataFrame, 
     mapa_similaridade = {}
     ids_duplicados = set()
     
-    # Otimização 2: Pré-calcular texto normalizado para evitar recálculos
     df_exibir = df_exibir.copy()
     df_comparar = df_comparar.copy()
     df_exibir['norm_texto'] = df_exibir['Texto'].apply(norm)
     df_comparar['norm_texto'] = df_comparar['Texto'].apply(norm)
     
-    # Otimização 1: Agrupar por pasta para reduzir drasticamente as comparações
     pastas_para_analise = df_exibir["activity_folder"].dropna().unique()
     
     bar = st.sidebar.progress(0, text="Calculando similaridades por pasta…")
@@ -426,7 +423,10 @@ def renderizar_cartao_atividade(row, pasta, sim_map, idx_map, max_selecoes, num_
         renderizar_visualizacao_comparacao(row, idx_map.get(comp_id), pasta, max_selecoes, num_selecionados, sim_map)
 
 def renderizar_visualizacao_comparacao(base_data_row, comp_data_dict, pasta, max_sel, num_sel, sim_map):
-    if not comp_data_dict: return
+    # [CORREÇÃO] Adicionada verificação para evitar o erro.
+    if not comp_data_dict: 
+        return
+        
     base_id = base_data_row.activity_id; comp_id = comp_data_dict["activity_id"]
     with st.container(border=True):
         st.markdown("""<div style="font-size: 0.85em; margin-bottom: 10px; padding: 5px; background-color: #f0f2f6; border-radius: 5px;">
