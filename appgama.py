@@ -10,11 +10,13 @@ from rapidfuzz import fuzz, process
 from api_functions import HttpClient
 from difflib import SequenceMatcher
 from collections import deque
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ==============================================================================
 # 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
 # ==============================================================================
-SUFFIX = "_v22_final_fix"
+SUFFIX = "_v23_firebase"
 
 class SK:
     LOGGED_IN = "logged_in"
@@ -66,13 +68,34 @@ def inicializar_session_state():
     }
     for key, value in defaults.items(): st.session_state.setdefault(key, value)
 
+@st.cache_resource
+def initialize_firebase():
+    """Inicializa a conexão com o Firebase usando os secrets do Streamlit."""
+    try:
+        if "firebase_credentials" not in st.secrets:
+            st.error("Credenciais do Firebase não encontradas nos secrets do Streamlit.")
+            st.stop()
+        
+        creds_dict = dict(st.secrets["firebase_credentials"])
+        creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+        cred = credentials.Certificate(creds_dict)
+        
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        
+        return firestore.client()
+    except Exception as e:
+        st.error(f"Falha ao inicializar o Firebase: {e}")
+        st.stop()
+
 # ==============================================================================
 # 3. FUNÇÕES AUXILIARES E DE LÓGICA
 # ==============================================================================
 
-def as_sp(ts: pd.Timestamp | None) -> datetime | None:
+def as_sp(ts: any) -> datetime | None:
     if pd.isna(ts): return None
     if isinstance(ts, str): ts = pd.to_datetime(ts)
+    if isinstance(ts, (int, float)): ts = pd.to_datetime(ts, unit='s')
     if ts.tzinfo is None: ts = ts.tz_localize(TZ_UTC)
     return ts.tz_convert(TZ_SP)
 
@@ -99,7 +122,7 @@ def df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode('utf-8')
 
 # ==============================================================================
-# 4. LÓGICA DE DADOS (MYSQL PARA DADOS, SQLITE PARA LOG)
+# 4. LÓGICA DE DADOS (MYSQL PARA DADOS, FIREBASE PARA LOG)
 # ==============================================================================
 
 @st.cache_resource
@@ -112,21 +135,6 @@ def db_engine_mysql() -> Engine:
         return engine
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro ao conectar ao banco de dados principal."); st.stop()
-
-@st.cache_resource
-def db_engine_log() -> Engine:
-    try:
-        engine = create_engine("sqlite:///log_auditoria.db")
-        with engine.connect() as conn:
-            conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS log_auditoria_duplicatas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME NOT NULL,
-                usuario VARCHAR(255) NOT NULL, acao VARCHAR(255) NOT NULL, detalhes TEXT
-            )"""))
-            conn.commit()
-        return engine
-    except Exception as e:
-        st.error(f"Erro ao criar o banco de dados de log: {e}"); st.stop()
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar_dados_mysql(eng: Engine, dias_historico: int) -> pd.DataFrame:
@@ -178,39 +186,48 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
     st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
     return groups
 
-# [CORREÇÃO] Adicionado hash_funcs para o objeto Engine, que não é "hashable" por padrão.
-@st.cache_data(ttl=60, hash_funcs={Engine: lambda _: None})
-def carregar_log_auditoria(eng: Engine, search_term: str, start_date, end_date) -> pd.DataFrame:
-    query_base = "SELECT timestamp, usuario, acao, detalhes FROM log_auditoria_duplicatas WHERE 1=1"
-    params = {}
-    if search_term:
-        query_base += " AND (usuario LIKE :term OR acao LIKE :term OR detalhes LIKE :term)"
-        params['term'] = f"%{search_term}%"
-    if start_date:
-        query_base += " AND date(timestamp) >= :start"
-        params['start'] = start_date
-    if end_date:
-        query_base += " AND date(timestamp) <= :end"
-        params['end'] = end_date
-    query_base += " ORDER BY timestamp DESC LIMIT 200"
-    try:
-        with eng.connect() as conn: return pd.read_sql(text(query_base), conn, params=params)
-    except Exception: return pd.DataFrame()
+@st.cache_data(ttl=60)
+def carregar_log_firestore(_db_client, search_term: str, start_date, end_date) -> pd.DataFrame:
+    """Carrega o log de auditoria do Firestore."""
+    db = initialize_firebase() # Garante que temos o cliente
+    collection_ref = db.collection('log_auditoria_duplicatas')
+    query = collection_ref.order_by('timestamp', direction=firestore.Query.DESCENDING)
 
-def log_action(eng: Engine, user: str, action: str, details: dict):
-    query = text("INSERT INTO log_auditoria_duplicatas (timestamp, usuario, acao, detalhes) VALUES (:ts, :user, :action, :details)")
+    docs = query.limit(500).stream()
+    log_data = [doc.to_dict() for doc in docs]
+
+    if not log_data: return pd.DataFrame()
+
+    df = pd.DataFrame(log_data)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    if start_date: df = df[df['timestamp'].dt.date >= start_date]
+    if end_date: df = df[df['timestamp'].dt.date <= end_date]
+    if search_term:
+        term = search_term.lower()
+        df = df[df.apply(lambda row: term in str(row['usuario']).lower() or term in str(row['acao']).lower() or term in str(row['detalhes']).lower(), axis=1)]
+        
+    return df.head(200)
+
+def log_action_firestore(db, user: str, action: str, details: dict):
+    """Insere uma nova entrada na coleção de log do Firestore."""
     try:
-        with eng.connect() as conn:
-            conn.execute(query, {"ts": datetime.now(TZ_SP), "user": user, "action": action, "details": json.dumps(details)})
-            conn.commit()
-        carregar_log_auditoria.clear()
-    except Exception as e: logging.error(f"Falha ao registrar log no BD: {e}")
+        log_entry = {
+            "timestamp": datetime.now(TZ_UTC),
+            "usuario": user,
+            "acao": action,
+            "detalhes": json.dumps(details)
+        }
+        db.collection('log_auditoria_duplicatas').add(log_entry)
+        carregar_log_firestore.clear()
+    except Exception as e:
+        logging.error(f"Falha ao registrar log no Firestore: {e}")
 
 # ==============================================================================
 # 5. COMPONENTES DE UI
 # ==============================================================================
 
-def renderizar_sidebar_primaria() -> dict:
+def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
     st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
     if st.sidebar.button("Logout"): st.session_state.clear(); st.rerun()
 
@@ -223,34 +240,11 @@ def renderizar_sidebar_primaria() -> dict:
         "dias_historico": st.sidebar.number_input("Dias para Comparação", min_value=7, value=90, step=1),
         "data_inicio": st.sidebar.date_input("Data Início", date.today() - timedelta(days=DIAS_FILTRO_PADRAO_INICIO)),
         "data_fim": st.sidebar.date_input("Data Fim", date.today() + timedelta(days=DIAS_FILTRO_PADRAO_FIM)),
-    }
-    return filtros
-
-def renderizar_sidebar_secundaria(df_completo: pd.DataFrame, filtros_primarios: dict) -> dict:
-    pastas_options = sorted(df_completo["activity_folder"].dropna().unique()) if not df_completo.empty else []
-    status_options = sorted(df_completo["activity_status"].dropna().unique()) if not df_completo.empty else []
-
-    filtros_secundarios = {
-        "pastas": st.sidebar.multiselect("Pastas", pastas_options),
-        "status": st.sidebar.multiselect("Status", status_options),
+        "pastas": st.sidebar.multiselect("Pastas", sorted(df_completo["activity_folder"].dropna().unique()) if not df_completo.empty else []),
+        "status": st.sidebar.multiselect("Status", sorted(df_completo["activity_status"].dropna().unique()) if not df_completo.empty else []),
         "min_sim": st.sidebar.slider("Similaridade Mínima (%)", 0, 100, 90, 1) / 100
     }
-    
-    # [CORREÇÃO] Funcionalidade de salvar/carregar filtros restaurada
-    st.sidebar.subheader("Salvar/Carregar Filtros")
-    saved_filters = st.session_state[SK.SAVED_FILTERS]
-    filter_name = st.sidebar.text_input("Nome para salvar filtro")
-    if st.sidebar.button("Salvar Filtros Atuais") and filter_name:
-        filtros_para_salvar = {**filtros_primarios, **filtros_secundarios}
-        saved_filters[filter_name] = filtros_para_salvar
-        st.sidebar.success(f"Filtro '{filter_name}' salvo!")
-    
-    if saved_filters:
-        selected_filter = st.sidebar.selectbox("Carregar Filtro Salvo", [""] + list(saved_filters.keys()))
-        if selected_filter:
-            st.sidebar.info("Filtros carregados. Clique em 'Atualizar dados' para aplicar.")
-
-    return {**filtros_primarios, **filtros_secundarios}
+    return filtros
 
 def renderizar_grupo_duplicatas(group_data: list):
     group_id = group_data[0]['activity_id']
@@ -305,13 +299,13 @@ def renderizar_grupo_duplicatas(group_data: list):
 def app():
     api_client = inicializar_api_client()
     mysql_engine = db_engine_mysql()
-    log_engine = db_engine_log()
+    firestore_db = initialize_firebase()
     
-    filtros_primarios = renderizar_sidebar_primaria()
-    df_completo = carregar_dados_mysql(mysql_engine, filtros_primarios['dias_historico'])
+    df_completo = carregar_dados_mysql(mysql_engine, 90)
+    filtros = renderizar_sidebar(df_completo)
+    
+    df_completo = carregar_dados_mysql(mysql_engine, filtros['dias_historico'])
     if df_completo.empty: st.warning("Nenhuma atividade encontrada para o período."); st.stop()
-    
-    filtros = renderizar_sidebar_secundaria(df_completo, filtros_primarios)
 
     tab_principal, tab_log = st.tabs(["🔎 Análise de Duplicidades", "📜 Histórico de Ações"])
 
@@ -332,8 +326,8 @@ def app():
         if header_c2.button("Processar Ações"):
             for group_id, state in st.session_state[SK.GROUP_STATES].items():
                 for act_id in state['cancelados']:
-                    log_action(log_engine, st.session_state[SK.USERNAME], "Cancelamento", {"activity_id": act_id, "grupo": group_id})
-                log_action(log_engine, st.session_state[SK.USERNAME], "Marcar Principal", {"activity_id": state['principal_id'], "grupo": group_id})
+                    log_action_firestore(firestore_db, st.session_state[SK.USERNAME], "Cancelamento", {"activity_id": act_id, "grupo": group_id})
+                log_action_firestore(firestore_db, st.session_state[SK.USERNAME], "Marcar Principal", {"activity_id": state['principal_id'], "grupo": group_id})
             st.success("Ações registradas no histórico!")
             st.rerun()
 
@@ -355,7 +349,7 @@ def app():
         start_date = c2.date_input("De", None)
         end_date = c3.date_input("Até", None)
         
-        df_log = carregar_log_auditoria(log_engine, search_term, start_date, end_date)
+        df_log = carregar_log_firestore(firestore_db, search_term, start_date, end_date)
         if df_log.empty:
             st.info("Nenhuma ação registrada para os filtros selecionados.")
         else:
