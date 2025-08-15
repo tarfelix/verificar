@@ -14,7 +14,7 @@ from collections import deque
 # ==============================================================================
 # 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
 # ==============================================================================
-SUFFIX = "_v21_final_merged"
+SUFFIX = "_v22_final_fix"
 
 class SK:
     LOGGED_IN = "logged_in"
@@ -178,7 +178,8 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
     st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
     return groups
 
-@st.cache_data(ttl=60)
+# [CORREÇÃO] Adicionado hash_funcs para o objeto Engine, que não é "hashable" por padrão.
+@st.cache_data(ttl=60, hash_funcs={Engine: lambda _: None})
 def carregar_log_auditoria(eng: Engine, search_term: str, start_date, end_date) -> pd.DataFrame:
     query_base = "SELECT timestamp, usuario, acao, detalhes FROM log_auditoria_duplicatas WHERE 1=1"
     params = {}
@@ -234,6 +235,21 @@ def renderizar_sidebar_secundaria(df_completo: pd.DataFrame, filtros_primarios: 
         "status": st.sidebar.multiselect("Status", status_options),
         "min_sim": st.sidebar.slider("Similaridade Mínima (%)", 0, 100, 90, 1) / 100
     }
+    
+    # [CORREÇÃO] Funcionalidade de salvar/carregar filtros restaurada
+    st.sidebar.subheader("Salvar/Carregar Filtros")
+    saved_filters = st.session_state[SK.SAVED_FILTERS]
+    filter_name = st.sidebar.text_input("Nome para salvar filtro")
+    if st.sidebar.button("Salvar Filtros Atuais") and filter_name:
+        filtros_para_salvar = {**filtros_primarios, **filtros_secundarios}
+        saved_filters[filter_name] = filtros_para_salvar
+        st.sidebar.success(f"Filtro '{filter_name}' salvo!")
+    
+    if saved_filters:
+        selected_filter = st.sidebar.selectbox("Carregar Filtro Salvo", [""] + list(saved_filters.keys()))
+        if selected_filter:
+            st.sidebar.info("Filtros carregados. Clique em 'Atualizar dados' para aplicar.")
+
     return {**filtros_primarios, **filtros_secundarios}
 
 def renderizar_grupo_duplicatas(group_data: list):
@@ -306,6 +322,9 @@ def app():
         df_filtrado = df_filtrado[df_filtrado["activity_date"].dt.date.between(filtros["data_inicio"], filtros["data_fim"])]
 
         grupos_duplicados = criar_grupos_de_duplicatas(df_filtrado, filtros["min_sim"])
+
+        if st.session_state.get(SK.GROUP_STATES) and not grupos_duplicados:
+            st.session_state[SK.GROUP_STATES] = {}
 
         header_c1, header_c2, header_c3 = st.columns([4, 1, 1])
         header_c1.markdown(f"### {len(grupos_duplicados)} Grupos de Duplicatas Encontrados")
