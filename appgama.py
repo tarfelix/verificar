@@ -1,7 +1,7 @@
 
 import streamlit as st
 import pandas as pd
-import re, html, os, logging, json
+import re, html, os, logging, json, hashlib
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text, exc
@@ -17,7 +17,7 @@ from firebase_admin import credentials, firestore
 # ==============================================================================
 # 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
 # ==============================================================================
-SUFFIX = "_v24_firebase_sim"
+SUFFIX = "_v25_revisado"
 
 class SK:
     LOGGED_IN = "logged_in"
@@ -34,9 +34,14 @@ DIAS_FILTRO_PADRAO_FIM = 14
 TZ_SP  = ZoneInfo("America/Sao_Paulo")
 TZ_UTC = ZoneInfo("UTC")
 
-# Limiares de similaridade para badge
-SIM_HIGH = 90
-SIM_MED  = 75
+# Limiares para badge (ajustados ao novo score combinado)
+SIM_HIGH = 85
+SIM_MED  = 70
+
+# Parâmetros do agrupamento (afináveis via st.secrets["similarity"])
+SIM_MIN_CONTAINMENT = int(st.secrets.get("similarity", {}).get("min_containment", 55))  # %
+SIM_PRE_CUTOFF_DELTA = int(st.secrets.get("similarity", {}).get("pre_cutoff_delta", 10)) # pontos a menos que cutoff final
+DIFF_HARD_LIMIT = int(st.secrets.get("similarity", {}).get("diff_hard_limit", 12000))    # nº máx de chars para diff palavra-a-palavra
 
 st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
 st.markdown("""
@@ -75,7 +80,7 @@ def inicializar_api_client() -> HttpClient:
 def inicializar_session_state():
     defaults = {
         SK.LOGGED_IN: False, SK.USERNAME: "", SK.LAST_UPDATE: None,
-        SK.SIMILARITY_CACHE: None, SK.PAGE_NUMBER: 0,
+        SK.SIMILARITY_CACHE: None, SK.PAGE_NUMBER: 1,
         SK.SAVED_FILTERS: {}, SK.GROUP_STATES: {}
     }
     for key, value in defaults.items():
@@ -102,43 +107,95 @@ def initialize_firebase():
         st.stop()
 
 # ==============================================================================
-# 3. FUNÇÕES AUXILIARES E DE LÓGICA
+# 3. NORMALIZAÇÃO E SIMILARIDADE
 # ==============================================================================
 
-def as_sp(ts: any) -> datetime | None:
-    if pd.isna(ts): return None
-    if isinstance(ts, str): ts = pd.to_datetime(ts)
-    if isinstance(ts, (int, float)): ts = pd.to_datetime(ts, unit='s')
-    if ts.tzinfo is None: ts = ts.tz_localize(TZ_UTC)
-    return ts.tz_convert(TZ_SP)
+_re_url = re.compile(r"https?://\S+")
+_re_proc = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
+_re_idtoken = re.compile(r"#id[:\s]*[a-z0-9]+", re.IGNORECASE)
+_re_num = re.compile(r"\b\d{2,}\b")               # sequências numéricas longas
+_re_date = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
+_re_time = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
+
+# Stopwords / boilerplate (após unidecode + lower)
+BASE_STOPWORDS = set("""
+de do da dos das e a o os as para por com sem no na nos nas ao aos às que em um uma uns umas 
+poder judiciario tribunal regional do trabalho justica do trabalho vara do trabalho diario de justica eletronico nacional 
+dejtn djej djen publicacao numeroarquivo numeropublicacao titulo cabecalho textopublicacao inteiro teor
+tipo de comunicacao tipo de documento orgao processo autos intimacao citacao intimado citado intimados citados
+advogado advogados oab juiz juiza substituta secretaria pericia perito laudo diligencia despacho ata
+cidade estado brasil sao jose dos campos sp
+""".split())
+
+EXTRA_STOPWORDS = set(map(str.lower, st.secrets.get("similarity", {}).get("stopwords_extra", [])))
 
 def norm(text: str | None) -> str:
     if not isinstance(text, str): return ""
     text = unidecode(text.lower())
+    text = _re_url.sub(" url ", text)
+    text = _re_proc.sub(" numproc ", text)
+    text = _re_idtoken.sub(" idtoken ", text)
+    text = _re_date.sub(" data ", text)
+    text = _re_time.sub(" hora ", text)
+    text = _re_num.sub(" num ", text)
     text = re.sub(r"[^\w\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def norm_drop_boilerplate(text: str) -> str:
+    """Remove tokens hiperfrequentes/boilerplate para reduzir falsos positivos."""
+    tokens = [t for t in text.split() if t not in BASE_STOPWORDS and t not in EXTRA_STOPWORDS]
+    return " ".join(tokens)
+
+def prep_for_similarity(text: str | None) -> str:
+    return norm_drop_boilerplate(norm(text))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _combined_similarity(a: str, b: str) -> tuple[int, dict]:
+    """Score combinado que penaliza anexos longos e boilerplate.
+       Retorna (score_final_0a100, breakdown_dict)."""
+    A = prep_for_similarity(a); B = prep_for_similarity(b)
+    if not A or not B:
+        return (0, {"set": 0, "tok": 0, "containment": 0, "len_pen": 0, "jaccard": 0})
+    s_set = int(fuzz.token_set_ratio(A, B))
+    s_tok = int(fuzz.token_ratio(A, B))
+    sa, sb = set(A.split()), set(B.split())
+    if sa and sb:
+        inter = len(sa & sb); uni = len(sa | sb)
+        containment = int(100 * inter / max(len(sa), len(sb)))
+        jaccard = int(100 * inter / max(1, uni))
+    else:
+        containment = jaccard = 0
+    len_pen = int(100 * min(len(A), len(B)) / max(len(A), len(B)))
+    score = round(0.40 * s_set + 0.30 * s_tok + 0.20 * containment + 0.10 * len_pen)
+    return score, {"set": s_set, "tok": s_tok, "containment": containment, "len_pen": len_pen, "jaccard": jaccard}
 
 def compute_similarity_pct(a: str, b: str) -> int:
-    """Similaridade 0..100 usando token_set_ratio após normalização."""
-    return int(fuzz.token_set_ratio(norm(a), norm(b)))
+    score, _ = _combined_similarity(a, b)
+    return int(score)
 
-def similarity_badge(pct: int, label_prefix: str = "Similaridade") -> str:
-    """Gera um badge colorido conforme thresholds."""
+def similarity_badge(pct: int, label_prefix: str = "Similaridade", breakdown: dict | None = None) -> str:
     if pct >= SIM_HIGH:
-        bg = "#C8E6C9"   # verde claro
+        bg = "#C8E6C9"
     elif pct >= SIM_MED:
-        bg = "#FFE082"   # âmbar
+        bg = "#FFE082"
     else:
-        bg = "#FFCDD2"   # vermelho claro
-    return f"<span class='similarity-badge' style='background-color:{bg}'>{label_prefix}: {pct}%</span>"
+        bg = "#FFCDD2"
+    title = ""
+    if breakdown:
+        title = f"title='set:{breakdown['set']} tok:{breakdown['tok']} cont:{breakdown['containment']} len:{breakdown['len_pen']}'"
+    return f"<span class='similarity-badge' {title} style='background-color:{bg}'>{label_prefix}: {pct}%</span>"
 
-def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
-    tokens1 = [token for token in re.split(r'(\W+)', text1 or "") if token]
-    tokens2 = [token for token in re.split(r'(\W+)', text2 or "") if token]
-    sm = SequenceMatcher(None, tokens1, tokens2, autojunk=False)
+# ==============================================================================
+# 4. DIFF OTIMIZADO (rápido para textos longos)
+# ==============================================================================
+
+def _highlight_diffs_tokens(tokens1, tokens2):
+    sm = SequenceMatcher(None, tokens1, tokens2)  # autojunk=True (default) acelera textos grandes
     out1, out2 = [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        slice1, slice2 = html.escape("".join(tokens1[i1:i2])), html.escape("".join(tokens2[j1:j2]))
+        slice1 = html.escape("".join(tokens1[i1:i2] if isinstance(tokens1[0], str) else tokens1[i1:i2]))
+        slice2 = html.escape("".join(tokens2[j1:j2] if isinstance(tokens2[0], str) else tokens2[j1:j2]))
         if tag == 'equal':
             out1.append(slice1); out2.append(slice2)
         elif tag == 'replace':
@@ -148,6 +205,19 @@ def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
         elif tag == 'insert':
             out2.append(f"<span class='diff-ins'>{slice2}</span>")
     return (f"<pre class='highlighted-text'>{''.join(out1)}</pre>", f"<pre class='highlighted-text'>{''.join(out2)}</pre>")
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
+    # Estratégia adaptativa: palavra-a-palavra até DIFF_HARD_LIMIT; senão, por sentenças/linhas
+    if (len(text1) + len(text2)) <= DIFF_HARD_LIMIT:
+        tokens1 = [t for t in re.split(r'(\W+)', text1 or "") if t]
+        tokens2 = [t for t in re.split(r'(\W+)', text2 or "") if t]
+        return _highlight_diffs_tokens(tokens1, tokens2)
+    # fallback por sentenças/linhas (muito mais rápido)
+    sent_split = r'(?<=[\.\!\?\:;])\s+|\n+'
+    t1 = [s + "\n" for s in re.split(sent_split, text1 or "") if s]
+    t2 = [s + "\n" for s in re.split(sent_split, text2 or "") if s]
+    return _highlight_diffs_tokens(t1, t2)
 
 def df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode('utf-8')
@@ -159,7 +229,7 @@ def _to_int(val):
         return None
 
 # ==============================================================================
-# 4. LÓGICA DE DADOS (MYSQL PARA DADOS, FIREBASE PARA LOG)
+# 5. LÓGICA DE DADOS (MYSQL PARA DADOS, FIREBASE PARA LOG)
 # ==============================================================================
 
 @st.cache_resource
@@ -200,60 +270,13 @@ def carregar_dados_mysql(eng: Engine, dias_historico: int) -> pd.DataFrame:
               .drop_duplicates("activity_id", keep="first")
               .drop(columns="status_ord")
         )
+        # Pré-processamentos p/ similaridade
+        df["prep_text"] = df["Texto"].apply(prep_for_similarity)
+        df["prep_len"] = df["prep_text"].str.len().fillna(0).astype(int)
+        df["prep_set"] = df["prep_text"].apply(lambda s: set(s.split()) if s else set())
         return df.sort_values(["activity_folder", "activity_date"], ascending=[True, False])
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro ao carregar dados do banco principal."); return pd.DataFrame()
-
-def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
-    """Agrupa duplicatas por pasta usando similaridade token_set_ratio e componentes conexos (BFS)."""
-    if df.empty:
-        return []
-
-    df = df.copy()
-    df['norm_texto'] = df['Texto'].apply(norm)
-
-    # Assinatura de cache inclui id, pasta e fingerprint do texto (len) + limiar
-    sig = (
-        tuple(sorted((row["activity_id"], row.get("activity_folder") or "", len(row["norm_texto"]))
-                     for _, row in df.iterrows())),
-        round(min_sim, 3)
-    )
-    cached = st.session_state.get(SK.SIMILARITY_CACHE)
-    if cached and cached.get("sig") == sig:
-        return cached["groups"]
-
-    groups = []
-    cutoff = int(min_sim * 100)
-    ph = st.sidebar.empty()
-    pb = ph.progress(0, text="Agrupando duplicatas...")
-
-    total_processado = 0
-    for folder, dff in df.groupby("activity_folder", dropna=False):
-        n = len(dff)
-        if n < 2:
-            total_processado += n
-            continue
-        texts = dff["norm_texto"].tolist()
-        sim = process.cdist(texts, texts, scorer=fuzz.token_set_ratio, score_cutoff=cutoff)
-        visitados = set()
-        for i in range(n):
-            if i in visitados: continue
-            comp = {i}
-            fila = deque([i])
-            visitados.add(i)
-            while fila:
-                k = fila.popleft()
-                for j in range(n):
-                    if j not in visitados and sim[k][j] >= cutoff:
-                        visitados.add(j); comp.add(j); fila.append(j)
-            if len(comp) > 1:
-                comp_idxs = sorted(list(comp), key=lambda idx: dff.iloc[idx]["activity_date"], reverse=True)
-                groups.append([dff.iloc[idx].to_dict() for idx in comp_idxs])
-        total_processado += n
-        pb.progress(min(1.0, total_processado / len(df)), text="Analisando pastas...")
-    ph.empty()
-    st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
-    return groups
 
 @st.cache_data(ttl=60)
 def carregar_log_firestore(_db_client, search_term: str, start_date, end_date) -> pd.DataFrame:
@@ -293,7 +316,80 @@ def log_action_firestore(db, user: str, action: str, details: dict):
         logging.error(f"Falha ao registrar log no Firestore: {e}")
 
 # ==============================================================================
-# 5. COMPONENTES DE UI
+# 6. AGRUPAMENTO COM PENALIZAÇÃO POR CONTEÚDO EXTRA
+# ==============================================================================
+
+def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
+    """Agrupa duplicatas por pasta com duas etapas:
+       1) Candidatos rápidos via token_set (RapidFuzz, C-level)
+       2) Validação com score combinado + containment mínimo"""
+    if df.empty:
+        return []
+
+    df = df.copy()
+    cutoff = int(min_sim * 100)
+    pre_cutoff = max(60, cutoff - SIM_PRE_CUTOFF_DELTA)
+
+    # Assinatura de cache inclui id, pasta e fingerprint do texto (len) + limiar e parâmetros de sim
+    sig = (
+        tuple(sorted((row["activity_id"], row.get("activity_folder") or "", int(row.get("prep_len",0)))
+                     for _, row in df.iterrows())),
+        cutoff, pre_cutoff, SIM_MIN_CONTAINMENT
+    )
+    cached = st.session_state.get(SK.SIMILARITY_CACHE)
+    if cached and cached.get("sig") == sig:
+        return cached["groups"]
+
+    groups = []
+    ph = st.sidebar.empty()
+    pb = ph.progress(0, text="Agrupando duplicatas...")
+
+    total_processado = 0
+    for folder, dff in df.groupby("activity_folder", dropna=False):
+        n = len(dff)
+        if n < 2:
+            total_processado += n
+            continue
+
+        texts = dff["prep_text"].tolist()
+        sets_list = dff["prep_set"].tolist()
+
+        # Matriz rápida para cortar pares óbvios
+        sim_fast = process.cdist(texts, texts, scorer=fuzz.token_set_ratio, score_cutoff=pre_cutoff)
+
+        visitados = set()
+        for i in range(n):
+            if i in visitados: continue
+            comp = {i}
+            fila = deque([i])
+            visitados.add(i)
+            while fila:
+                k = fila.popleft()
+                for j in range(n):
+                    if j in visitados: 
+                        continue
+                    if sim_fast[k][j] < pre_cutoff:
+                        continue
+                    # Validação mais rigorosa
+                    score, breakdown = _combined_similarity(dff.iloc[k]["Texto"], dff.iloc[j]["Texto"])
+                    # containment direto via sets (mais barato e consistente)
+                    sa, sb = sets_list[k], sets_list[j]
+                    contain = int(100 * (len(sa & sb) / max(1, max(len(sa), len(sb)))))
+                    if score >= cutoff and contain >= SIM_MIN_CONTAINMENT:
+                        visitados.add(j); comp.add(j); fila.append(j)
+
+            if len(comp) > 1:
+                comp_idxs = sorted(list(comp), key=lambda idx: dff.iloc[idx]["activity_date"], reverse=True)
+                groups.append([dff.iloc[idx].to_dict() for idx in comp_idxs])
+
+        total_processado += n
+        pb.progress(min(1.0, total_processado / len(df)), text="Analisando pastas...")
+    ph.empty()
+    st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
+    return groups
+
+# ==============================================================================
+# 7. COMPONENTES DE UI
 # ==============================================================================
 
 def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
@@ -304,6 +400,7 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
     if st.sidebar.button("🔄 Atualizar dados"):
         st.session_state.pop(SK.SIMILARITY_CACHE, None)
         st.session_state.pop(SK.GROUP_STATES, None)
+        st.session_state[SK.PAGE_NUMBER] = 1
         carregar_dados_mysql.clear()
 
     st.sidebar.header("Filtros")
@@ -352,6 +449,7 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
             st.session_state["k_status"] = f.get("k_status", [])
             st.session_state["k_min_sim"] = f.get("k_min_sim", 90)
             st.sidebar.success("Filtros aplicados.")
+            st.session_state[SK.PAGE_NUMBER] = 1
             st.rerun()
 
     return {
@@ -363,14 +461,14 @@ def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
         "min_sim": st.session_state.get("k_min_sim", 90) / 100,
     }
 
-def renderizar_grupo_duplicatas(group_data: list):
+def renderizar_grupo_duplicatas(group_data: list, expand: bool = False):
     # chave do estado do grupo baseada no primeiro id (como antes)
     group_id = group_data[0]['activity_id']
     group_state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
         "principal_id": group_data[0]['activity_id'], "cancelados": set(), "comparacao_aberta": None
     })
 
-    with st.expander(f"Grupo de Duplicatas ({len(group_data)} atividades) - Pasta: {group_data[0]['activity_folder']}", expanded=True):
+    with st.expander(f"Grupo de Duplicatas ({len(group_data)} atividades) - Pasta: {group_data[0]['activity_folder']}", expanded=expand):
         # Localiza dados da principal atual
         principal_data = next(item for item in group_data if item['activity_id'] == group_state["principal_id"])
 
@@ -381,10 +479,10 @@ def renderizar_grupo_duplicatas(group_data: list):
 
             # Similaridade vs principal (100% para a própria principal)
             if is_principal:
-                sim_pct = 100
+                sim_pct, breakdown = 100, {"set":100,"tok":100,"containment":100,"len_pen":100,"jaccard":100}
             else:
-                sim_pct = compute_similarity_pct(principal_data['Texto'], item_data['Texto'])
-            badge = similarity_badge(sim_pct, "Similaridade c/ principal")
+                sim_pct, breakdown = _combined_similarity(principal_data['Texto'], item_data['Texto'])
+            badge = similarity_badge(int(sim_pct), "Similaridade c/ principal", breakdown)
 
             card_class = "card-principal" if is_principal else "card-cancelado" if is_cancelado else ""
             st.markdown(f"<div class='{card_class}'>", unsafe_allow_html=True)
@@ -408,10 +506,14 @@ def renderizar_grupo_duplicatas(group_data: list):
                 if not is_principal and st.button("⭐ Tornar Principal", key=f"principal_{item_id}"):
                     group_state["principal_id"] = item_id; st.rerun()
 
-                if st.checkbox("Marcar para Cancelar", value=is_cancelado, key=f"cancel_{item_id}"):
+                # [GATING] Só mostra o checkbox DEPOIS de abrir a comparação
+                show_cancel = (group_state["comparacao_aberta"] == item_id)
+                if show_cancel and st.checkbox("Marcar para Cancelar", value=is_cancelado, key=f"cancel_{item_id}"):
                     if not is_cancelado: group_state["cancelados"].add(item_id)
-                elif is_cancelado:
-                    group_state["cancelados"].discard(item_id)
+                elif show_cancel and is_cancelado:
+                    # permitir desmarcar
+                    if not st.session_state.get(f"cancel_{item_id}"):
+                        group_state["cancelados"].discard(item_id)
 
                 if not is_principal and st.button("⚖ Comparar com Principal", key=f"compare_{item_id}"):
                     group_state["comparacao_aberta"] = item_id; st.rerun()
@@ -422,14 +524,15 @@ def renderizar_grupo_duplicatas(group_data: list):
             principal_data = next(item for item in group_data if item['activity_id'] == group_state["principal_id"])
             comparado_data = next(item for item in group_data if item['activity_id'] == group_state["comparacao_aberta"])
             st.markdown("---")
-            # Badge de similaridade na área de comparação
-            sim_pct = compute_similarity_pct(principal_data['Texto'], comparado_data['Texto'])
-            badge = similarity_badge(sim_pct, "Similaridade (diff)")
+            # Badge de similaridade na área de comparação (com breakdown)
+            sim_pct, breakdown = _combined_similarity(principal_data['Texto'], comparado_data['Texto'])
+            badge = similarity_badge(int(sim_pct), "Similaridade (diff)", breakdown)
             ctitle1, ctitle2 = st.columns(2)
             ctitle1.markdown(f"**Principal: ID `{principal_data['activity_id']}`** {badge}", unsafe_allow_html=True)
             ctitle2.markdown(f"**Comparado: ID `{comparado_data['activity_id']}`**", unsafe_allow_html=True)
 
-            hA, hB = highlight_diffs(principal_data['Texto'], comparado_data['Texto'])
+            with st.spinner("Calculando diferenças..."):
+                hA, hB = highlight_diffs(principal_data['Texto'], comparado_data['Texto'])
             c1, c2 = st.columns(2)
             c1.markdown(hA, unsafe_allow_html=True)
             c2.markdown(hB, unsafe_allow_html=True)
@@ -437,7 +540,7 @@ def renderizar_grupo_duplicatas(group_data: list):
                 group_state["comparacao_aberta"] = None; st.rerun()
 
 # ==============================================================================
-# 6. APLICAÇÃO PRINCIPAL
+# 8. APLICAÇÃO PRINCIPAL
 # ==============================================================================
 
 def app():
@@ -445,7 +548,7 @@ def app():
     mysql_engine = db_engine_mysql()
     firestore_db = initialize_firebase()
 
-    # Carrega base histórica ampla
+    # Carrega base histórica ampla (para popular filtros)
     df_completo = carregar_dados_mysql(mysql_engine, st.session_state.get("k_dias_historico", 90))
 
     filtros = renderizar_sidebar(df_completo)
@@ -471,7 +574,7 @@ def app():
         mask_recente = df_base['activity_date'].dt.date.between(filtros['data_inicio'], filtros['data_fim'])
         ids_recente = set(df_base.loc[mask_recente, 'activity_id'])
 
-        # Agrupamento considera RECENTE + HISTÓRICO
+        # Agrupamento considera RECENTE + HISTÓRICO (com validação rigorosa)
         grupos_todos = criar_grupos_de_duplicatas(df_base, filtros["min_sim"])
 
         # Exibir apenas grupos que toquem o período recente
@@ -497,7 +600,6 @@ def app():
                         if aid is None:
                             raise ValueError(f"ID inválido: {act_id}")
                         resp = api_client.activity_canceled(aid, usuario)
-                        # Cliente atual retorna None em falhas; tratamos isso
                         if isinstance(resp, dict) and resp.get("error"):
                             resultados["cancelados_fail"].append({"id": act_id, "erro": resp["error"]})
                             log_action_firestore(firestore_db, usuario, "Cancelamento(API-erro)",
@@ -535,29 +637,49 @@ def app():
             df_export = pd.DataFrame(export_data)
             header_c3.download_button("Exportar para CSV", df_to_csv(df_export), "relatorio_duplicatas.csv", "text/csv")
 
-        # Render
+        # --------- Paginação (sempre visível) ---------
         if not grupos_duplicados:
             st.info("Nenhum grupo de duplicatas encontrado para os filtros selecionados.")
         else:
-            # Paginação simples (opcional)
             total = len(grupos_duplicados)
-            page_count = (total + ITENS_POR_PAGINA - 1) // ITENS_POR_PAGINA
-            if page_count > 1:
-                page = st.number_input("Página", min_value=1, max_value=page_count, value=1, step=1)
-                ini = (page - 1) * ITENS_POR_PAGINA
-                fim = ini + ITENS_POR_PAGINA
-                grupos_page = grupos_duplicados[ini:fim]
-            else:
-                grupos_page = grupos_duplicados
+            itens_por_pagina = st.session_state.get("k_itens_pagina", ITENS_POR_PAGINA)
+            col_a, col_b, col_c, col_d, col_e = st.columns([2,1,2,1,2])
+            with col_a:
+                itens_por_pagina = st.number_input("Itens/página", min_value=5, max_value=50,
+                                                   value=itens_por_pagina, step=5, key="k_itens_pagina")
+            page_count = max(1, (total + itens_por_pagina - 1) // itens_por_pagina)
+            current_page = st.session_state.get(SK.PAGE_NUMBER, 1)
+            current_page = min(max(1, current_page), page_count)
+            with col_b:
+                st.write("")
+                if st.button("◀️ Anterior", disabled=(current_page <= 1)):
+                    st.session_state[SK.PAGE_NUMBER] = max(1, current_page - 1)
+                    st.rerun()
+            with col_c:
+                current_page = st.number_input("Página", min_value=1, max_value=page_count,
+                                               value=current_page, step=1, key="k_page_num")
+                st.session_state[SK.PAGE_NUMBER] = current_page
+            with col_d:
+                st.write("")
+                if st.button("Próxima ▶️", disabled=(current_page >= page_count)):
+                    st.session_state[SK.PAGE_NUMBER] = min(page_count, current_page + 1)
+                    st.rerun()
+            with col_e:
+                expand_all = st.toggle("Expandir todos", value=st.session_state.get("k_expand_all", False), key="k_expand_all")
 
+            ini = (st.session_state[SK.PAGE_NUMBER] - 1) * itens_por_pagina
+            fim = ini + itens_por_pagina
+            st.caption(f"Mostrando grupos {ini+1}–{min(fim, total)} de {total}")
+            st.divider()
+
+            grupos_page = grupos_duplicados[ini:fim]
             for i, grupo in enumerate(grupos_page):
-                renderizar_grupo_duplicatas(grupo)
+                renderizar_grupo_duplicatas(grupo, expand=expand_all)
 
     with tab_log:
         st.header("Histórico de Ações")
         c1, c2, c3 = st.columns([2,1,1])
         search_term = c1.text_input("Pesquisar por usuário, ação ou detalhes")
-        # Alguns ambientes do Streamlit não aceitam None; inicializa sem filtro e trate abaixo se necessário
         start_date = c2.date_input("De", None)
         end_date = c3.date_input("Até", None)
         
@@ -566,7 +688,9 @@ def app():
             st.info("Nenhuma ação registrada para os filtros selecionados.")
         else:
             for entry in df_log.itertuples():
-                ts_fmt = as_sp(entry.timestamp).strftime('%d/%m/%Y %H:%M:%S') if as_sp(entry.timestamp) else str(entry.timestamp)
+                ts = entry.timestamp if isinstance(entry.timestamp, pd.Timestamp) else pd.to_datetime(entry.timestamp)
+                ts_fmt = (ts.tz_localize(TZ_UTC).tz_convert(TZ_SP).strftime('%d/%m/%Y %H:%M:%S')
+                          if ts.tzinfo is None else ts.tz_convert(TZ_SP).strftime('%d/%m/%Y %H:%M:%S'))
                 st.markdown(f"**Ação:** `{entry.acao}` | **Usuário:** `{entry.usuario}` | **Data:** `{ts_fmt}`")
                 try:
                     st.json(json.loads(entry.detalhes) if isinstance(entry.detalhes, str) else entry.detalhes)
@@ -575,7 +699,7 @@ def app():
                 st.divider()
 
 # ==============================================================================
-# 7. LÓGICA DE LOGIN
+# 9. LÓGICA DE LOGIN
 # ==============================================================================
 
 def cred_ok(u, p):
