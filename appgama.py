@@ -1,24 +1,57 @@
+# -*- coding: utf-8 -*-
+"""
+Verificador de Duplicidade — Upgrades Extras
+- Pré‑índice por CNJ e/ou Pasta (DataJuri opcional)
+- Cutoffs por pasta via st.secrets
+- Histograma de similaridade para calibração
+- Retry/Rate‑limit/Dry‑run no client HTTP
+- Campos destacáveis (Processo/CNJ, Órgão, Tipo de Doc/Comunicação)
+- Badge com % de similaridade e tooltip com componentes
+- Diff adaptativo (não trava com textos muito grandes)
+- Checkbox “Marcar para cancelar” só aparece após abrir a comparação
+"""
+from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
-import re, html, os, logging, json, hashlib
+import os, re, json, html, logging, time, math
 from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
+from collections import defaultdict, deque
+from typing import Dict, List, Tuple, Optional
+
+import pandas as pd
+import numpy as np
+import streamlit as st
 from sqlalchemy import create_engine, text, exc
 from sqlalchemy.engine import Engine
+from zoneinfo import ZoneInfo
 from unidecode import unidecode
 from rapidfuzz import fuzz, process
-from api_functions import HttpClient
 from difflib import SequenceMatcher
-from collections import deque
-import firebase_admin
-from firebase_admin import credentials, firestore
 
-# ==============================================================================
-# 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
-# ==============================================================================
-SUFFIX = "_v25_revisado"
+# ====== opcionais ======
+try:
+    import altair as alt
+except Exception:
+    alt = None
 
+# Clientes locais
+try:
+    from api_functions_retry import HttpClientRetry
+except Exception:
+    HttpClientRetry = None
+
+try:
+    from datajuri_client import DataJuriClient
+except Exception:
+    DataJuriClient = None
+
+# =============================================================================
+# Configuração básica / Constantes
+# =============================================================================
+APP_TITLE = "Verificador de Duplicidade — Upgrades"
+TZ_SP  = ZoneInfo("America/Sao_Paulo")
+TZ_UTC = ZoneInfo("UTC")
+
+SUFFIX = "_v24_upgrades"
 class SK:
     LOGGED_IN = "logged_in"
     USERNAME = "username"
@@ -27,227 +60,95 @@ class SK:
     PAGE_NUMBER = f"page_{SUFFIX}"
     SAVED_FILTERS = f"saved_filters_{SUFFIX}"
     GROUP_STATES = f"group_states_{SUFFIX}"
+    CFG = f"cfg_{SUFFIX}"
 
-ITENS_POR_PAGINA = 10
-DIAS_FILTRO_PADRAO_INICIO = 7
-DIAS_FILTRO_PADRAO_FIM = 14
-TZ_SP  = ZoneInfo("America/Sao_Paulo")
-TZ_UTC = ZoneInfo("UTC")
+DEFAULTS = {
+    "itens_por_pagina": 10,
+    "dias_filtro_inicio": 7,
+    "dias_filtro_fim": 14,
+    "min_sim_global": 90,
+    "min_containment": 55,
+    "pre_cutoff_delta": 10,
+    "diff_hard_limit": 12000,
+}
 
-# Limiares para badge (ajustados ao novo score combinado)
-SIM_HIGH = 85
-SIM_MED  = 70
-
-# Parâmetros do agrupamento (afináveis via st.secrets["similarity"])
-SIM_MIN_CONTAINMENT = int(st.secrets.get("similarity", {}).get("min_containment", 55))  # %
-SIM_PRE_CUTOFF_DELTA = int(st.secrets.get("similarity", {}).get("pre_cutoff_delta", 10)) # pontos a menos que cutoff final
-DIFF_HARD_LIMIT = int(st.secrets.get("similarity", {}).get("diff_hard_limit", 12000))    # nº máx de chars para diff palavra-a-palavra
-
-st.set_page_config(layout="wide", page_title="Verificador de Duplicidade")
+st.set_page_config(layout="wide", page_title=APP_TITLE)
 st.markdown("""
 <style>
-    pre.highlighted-text {
-        white-space: pre-wrap; word-wrap: break-word; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
-        font-size: .9em; padding: 10px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; height: 300px; overflow-y: auto;
-    }
-    .similarity-badge { padding: 3px 6px; border-radius: 5px; color: black; font-weight: 600; display: inline-block; margin-left: 8px; }
-    .diff-del { background-color: #ffcdd2 !important; text-decoration: none !important; }
-    .diff-ins { background-color: #c8e6c9 !important; text-decoration: none !important; }
-    .vertical-align-bottom { display: flex; align-items: flex-end; height: 100%;}
-    .card-cancelado { background-color: #f5f5f5; border-left: 5px solid #e0e0e0; padding: 10px; margin-bottom: 5px; border-radius: 5px;}
-    .card-principal { border-left: 5px solid #4CAF50; }
+pre.highlighted-text {
+  white-space: pre-wrap; word-wrap: break-word; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  font-size: .9em; padding: 10px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; height: 360px; overflow-y: auto;
+}
+.similarity-badge { padding: 3px 6px; border-radius: 5px; color: black; font-weight: 600; display: inline-block; margin-bottom: 6px; }
+.diff-del { background-color: #ffcdd2 !important; text-decoration: none !important; }
+.diff-ins { background-color: #c8e6c9 !important; text-decoration: none !important; }
+.card-cancelado { background-color: #f5f5f5; border-left: 5px solid #e0e0e0; padding: 10px; margin-bottom: 5px; border-radius: 5px;}
+.card-principal { border-left: 5px solid #4CAF50; }
+.badge-green { background:#C8E6C9; }
+.badge-yellow{ background:#FFF9C4; }
+.badge-red   { background:#FFCDD2; }
+.meta-chip { background:#E0F7FA; padding:2px 6px; margin-right:6px; border-radius:8px; display:inline-block; font-size:0.85em; }
+.small-muted { color:#777; font-size:0.85em; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==============================================================================
-# 2. INICIALIZAÇÃO DE SERVIÇOS E ESTADO
-# ==============================================================================
+# =============================================================================
+# Inicialização de serviços
+# =============================================================================
 
-@st.cache_resource
-def inicializar_api_client() -> HttpClient:
-    cfg = st.secrets.get("api", {})
-    url_api, entity_id, token = [cfg.get(k) for k in ["url_api", "entity_id", "token"]]
-    if not all([url_api, entity_id, token]):
-        st.error("Credenciais da API não configuradas.")
-        st.stop()
-    try:
-        entity_id = int(entity_id)  # garante numérico para o cliente atual
-    except Exception:
-        st.error("`entity_id` inválido nos secrets. Deve ser numérico.")
-        st.stop()
-    return HttpClient(base_url=url_api, entity_id=entity_id, token=token)
-
-def inicializar_session_state():
-    defaults = {
-        SK.LOGGED_IN: False, SK.USERNAME: "", SK.LAST_UPDATE: None,
-        SK.SIMILARITY_CACHE: None, SK.PAGE_NUMBER: 1,
-        SK.SAVED_FILTERS: {}, SK.GROUP_STATES: {}
-    }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
-
-@st.cache_resource
-def initialize_firebase():
-    """Inicializa a conexão com o Firebase usando os secrets do Streamlit."""
-    try:
-        if "firebase_credentials" not in st.secrets:
-            st.error("Credenciais do Firebase não encontradas nos secrets do Streamlit.")
-            st.stop()
-        
-        creds_dict = dict(st.secrets["firebase_credentials"])
-        creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
-        cred = credentials.Certificate(creds_dict)
-        
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        
-        return firestore.client()
-    except Exception as e:
-        st.error(f"Falha ao inicializar o Firebase: {e}")
-        st.stop()
-
-# ==============================================================================
-# 3. NORMALIZAÇÃO E SIMILARIDADE
-# ==============================================================================
-
-_re_url = re.compile(r"https?://\S+")
-_re_proc = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
-_re_idtoken = re.compile(r"#id[:\s]*[a-z0-9]+", re.IGNORECASE)
-_re_num = re.compile(r"\b\d{2,}\b")               # sequências numéricas longas
-_re_date = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
-_re_time = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
-
-# Stopwords / boilerplate (após unidecode + lower)
-BASE_STOPWORDS = set("""
-de do da dos das e a o os as para por com sem no na nos nas ao aos às que em um uma uns umas 
-poder judiciario tribunal regional do trabalho justica do trabalho vara do trabalho diario de justica eletronico nacional 
-dejtn djej djen publicacao numeroarquivo numeropublicacao titulo cabecalho textopublicacao inteiro teor
-tipo de comunicacao tipo de documento orgao processo autos intimacao citacao intimado citado intimados citados
-advogado advogados oab juiz juiza substituta secretaria pericia perito laudo diligencia despacho ata
-cidade estado brasil sao jose dos campos sp
-""".split())
-
-EXTRA_STOPWORDS = set(map(str.lower, st.secrets.get("similarity", {}).get("stopwords_extra", [])))
-
-def norm(text: str | None) -> str:
-    if not isinstance(text, str): return ""
-    text = unidecode(text.lower())
-    text = _re_url.sub(" url ", text)
-    text = _re_proc.sub(" numproc ", text)
-    text = _re_idtoken.sub(" idtoken ", text)
-    text = _re_date.sub(" data ", text)
-    text = _re_time.sub(" hora ", text)
-    text = _re_num.sub(" num ", text)
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def norm_drop_boilerplate(text: str) -> str:
-    """Remove tokens hiperfrequentes/boilerplate para reduzir falsos positivos."""
-    tokens = [t for t in text.split() if t not in BASE_STOPWORDS and t not in EXTRA_STOPWORDS]
-    return " ".join(tokens)
-
-def prep_for_similarity(text: str | None) -> str:
-    return norm_drop_boilerplate(norm(text))
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _combined_similarity(a: str, b: str) -> tuple[int, dict]:
-    """Score combinado que penaliza anexos longos e boilerplate.
-       Retorna (score_final_0a100, breakdown_dict)."""
-    A = prep_for_similarity(a); B = prep_for_similarity(b)
-    if not A or not B:
-        return (0, {"set": 0, "tok": 0, "containment": 0, "len_pen": 0, "jaccard": 0})
-    s_set = int(fuzz.token_set_ratio(A, B))
-    s_tok = int(fuzz.token_ratio(A, B))
-    sa, sb = set(A.split()), set(B.split())
-    if sa and sb:
-        inter = len(sa & sb); uni = len(sa | sb)
-        containment = int(100 * inter / max(len(sa), len(sb)))
-        jaccard = int(100 * inter / max(1, uni))
-    else:
-        containment = jaccard = 0
-    len_pen = int(100 * min(len(A), len(B)) / max(len(A), len(B)))
-    score = round(0.40 * s_set + 0.30 * s_tok + 0.20 * containment + 0.10 * len_pen)
-    return score, {"set": s_set, "tok": s_tok, "containment": containment, "len_pen": len_pen, "jaccard": jaccard}
-
-def compute_similarity_pct(a: str, b: str) -> int:
-    score, _ = _combined_similarity(a, b)
-    return int(score)
-
-def similarity_badge(pct: int, label_prefix: str = "Similaridade", breakdown: dict | None = None) -> str:
-    if pct >= SIM_HIGH:
-        bg = "#C8E6C9"
-    elif pct >= SIM_MED:
-        bg = "#FFE082"
-    else:
-        bg = "#FFCDD2"
-    title = ""
-    if breakdown:
-        title = f"title='set:{breakdown['set']} tok:{breakdown['tok']} cont:{breakdown['containment']} len:{breakdown['len_pen']}'"
-    return f"<span class='similarity-badge' {title} style='background-color:{bg}'>{label_prefix}: {pct}%</span>"
-
-# ==============================================================================
-# 4. DIFF OTIMIZADO (rápido para textos longos)
-# ==============================================================================
-
-def _highlight_diffs_tokens(tokens1, tokens2):
-    sm = SequenceMatcher(None, tokens1, tokens2)  # autojunk=True (default) acelera textos grandes
-    out1, out2 = [], []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        slice1 = html.escape("".join(tokens1[i1:i2] if isinstance(tokens1[0], str) else tokens1[i1:i2]))
-        slice2 = html.escape("".join(tokens2[j1:j2] if isinstance(tokens2[0], str) else tokens2[j1:j2]))
-        if tag == 'equal':
-            out1.append(slice1); out2.append(slice2)
-        elif tag == 'replace':
-            out1.append(f"<span class='diff-del'>{slice1}</span>"); out2.append(f"<span class='diff-ins'>{slice2}</span>")
-        elif tag == 'delete':
-            out1.append(f"<span class='diff-del'>{slice1}</span>")
-        elif tag == 'insert':
-            out2.append(f"<span class='diff-ins'>{slice2}</span>")
-    return (f"<pre class='highlighted-text'>{''.join(out1)}</pre>", f"<pre class='highlighted-text'>{''.join(out2)}</pre>")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def highlight_diffs(text1: str, text2: str) -> tuple[str, str]:
-    # Estratégia adaptativa: palavra-a-palavra até DIFF_HARD_LIMIT; senão, por sentenças/linhas
-    if (len(text1) + len(text2)) <= DIFF_HARD_LIMIT:
-        tokens1 = [t for t in re.split(r'(\W+)', text1 or "") if t]
-        tokens2 = [t for t in re.split(r'(\W+)', text2 or "") if t]
-        return _highlight_diffs_tokens(tokens1, tokens2)
-    # fallback por sentenças/linhas (muito mais rápido)
-    sent_split = r'(?<=[\.\!\?\:;])\s+|\n+'
-    t1 = [s + "\n" for s in re.split(sent_split, text1 or "") if s]
-    t2 = [s + "\n" for s in re.split(sent_split, text2 or "") if s]
-    return _highlight_diffs_tokens(t1, t2)
-
-def df_to_csv(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode('utf-8')
-
-def _to_int(val):
-    try:
-        return int(str(val).strip())
-    except Exception:
-        return None
-
-# ==============================================================================
-# 5. LÓGICA DE DADOS (MYSQL PARA DADOS, FIREBASE PARA LOG)
-# ==============================================================================
+def _init_session_state():
+    if SK.CFG not in st.session_state:
+        st.session_state[SK.CFG] = {}
+    for k in [SK.LOGGED_IN, SK.USERNAME, SK.LAST_UPDATE, SK.SIMILARITY_CACHE, SK.PAGE_NUMBER, SK.SAVED_FILTERS, SK.GROUP_STATES]:
+        st.session_state.setdefault(k, None if k in [SK.LAST_UPDATE, SK.SIMILARITY_CACHE] else {} if k==SK.SAVED_FILTERS else False if k==SK.LOGGED_IN else 0 if k==SK.PAGE_NUMBER else {} if k==SK.GROUP_STATES else "")
 
 @st.cache_resource
 def db_engine_mysql() -> Engine:
-    cfg = st.secrets.get("database", {}); host, user, pw, db = [cfg.get(k) for k in ["host", "user", "password", "name"]]
+    cfg = st.secrets.get("database", {})
+    host, user, pw, db = [cfg.get(k) for k in ["host", "user", "password", "name"]]
     if not all([host, user, pw, db]):
-        st.error("Credenciais de banco ausentes.")
-        st.stop()
+        st.error("Credenciais do banco (MySQL) ausentes em st.secrets['database']."); st.stop()
     try:
         engine = create_engine(f"mysql+mysqlconnector://{user}:{pw}@{host}/{db}", pool_pre_ping=True, pool_recycle=3600)
         with engine.connect(): pass
         return engine
     except exc.SQLAlchemyError as e:
-        logging.exception(e); st.error("Erro ao conectar ao banco de dados principal."); st.stop()
+        logging.exception(e); st.error("Erro ao conectar no banco (MySQL)."); st.stop()
+
+@st.cache_resource
+def api_client() -> Optional[HttpClientRetry]:
+    cfg = st.secrets.get("api", {})
+    url_api, entity_id, token = [cfg.get(k) for k in ["url_api", "entity_id", "token"]]
+    client_cfg = st.secrets.get("api_client", {})
+    if not all([url_api, entity_id, token]) or HttpClientRetry is None:
+        return None
+    return HttpClientRetry(
+        base_url=url_api, entity_id=entity_id, token=token,
+        calls_per_second=float(client_cfg.get("calls_per_second", 3.0)),
+        max_attempts=int(client_cfg.get("max_attempts", 3)),
+        timeout=int(client_cfg.get("timeout", 15)),
+        dry_run=bool(client_cfg.get("dry_run", False))
+    )
+
+@st.cache_resource
+def datajuri_client() -> Optional[DataJuriClient]:
+    dj = st.secrets.get("datajuri", {})
+    if not dj or DataJuriClient is None:
+        return None
+    try:
+        c = DataJuriClient(**dj)
+        c.ensure_token()
+        return c
+    except Exception as e:
+        st.warning(f"DataJuri não inicializado: {e}")
+        return None
+
+# =============================================================================
+# Leitura de dados
+# =============================================================================
 
 @st.cache_data(ttl=3600, hash_funcs={Engine: lambda _: None})
 def carregar_dados_mysql(eng: Engine, dias_historico: int) -> pd.DataFrame:
-    """Carrega atividades do tipo 'Verificar' com janela histórica (Aberta sempre entra; Fechada só dentro do limite)."""
     limite = date.today() - timedelta(days=dias_historico)
     q = text("""
         SELECT activity_id, activity_folder, user_profile_name, activity_date, activity_status, Texto
@@ -258,468 +159,578 @@ def carregar_dados_mysql(eng: Engine, dias_historico: int) -> pd.DataFrame:
     try:
         with eng.connect() as conn:
             df = pd.read_sql(q, conn, params={"limite": limite})
-        if df.empty:
-            return pd.DataFrame()
+        if df.empty: return pd.DataFrame()
         df["activity_id"] = df["activity_id"].astype(str)
         df["activity_date"] = pd.to_datetime(df["activity_date"], errors="coerce")
         df["Texto"] = df["Texto"].fillna("").astype(str)
-        # Remover possíveis duplicatas do SELECT (mantém 'Aberta' se houver conflito)
         df["status_ord"] = df["activity_status"].map({"Aberta": 0}).fillna(1)
-        df = (
-            df.sort_values(["activity_id", "status_ord"])
-              .drop_duplicates("activity_id", keep="first")
-              .drop(columns="status_ord")
-        )
-        # Pré-processamentos p/ similaridade
-        df["prep_text"] = df["Texto"].apply(prep_for_similarity)
-        df["prep_len"] = df["prep_text"].str.len().fillna(0).astype(int)
-        df["prep_set"] = df["prep_text"].apply(lambda s: set(s.split()) if s else set())
-        return df.sort_values(["activity_folder", "activity_date"], ascending=[True, False])
+        df = df.sort_values(["activity_id", "status_ord"]).drop_duplicates("activity_id", keep="first").drop(columns="status_ord")
+        df = df.sort_values(["activity_folder", "activity_date"], ascending=[True, False])
+        return df
     except exc.SQLAlchemyError as e:
         logging.exception(e); st.error("Erro ao carregar dados do banco principal."); return pd.DataFrame()
 
-@st.cache_data(ttl=60)
-def carregar_log_firestore(_db_client, search_term: str, start_date, end_date) -> pd.DataFrame:
-    """Carrega o log de auditoria do Firestore."""
-    db = initialize_firebase() # Garante que temos o cliente
-    collection_ref = db.collection('log_auditoria_duplicatas')
-    query = collection_ref.order_by('timestamp', direction=firestore.Query.DESCENDING)
+# =============================================================================
+# Normalização, extração de metacampos e similaridade
+# =============================================================================
 
-    docs = query.limit(500).stream()
-    log_data = [doc.to_dict() for doc in docs]
+CNJ_RE = re.compile(r"(?:\b|^)(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})(?:\b|$)")
+URL_RE = re.compile(r"https?://\S+")
+DATENUM_RE = re.compile(r"\b(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b")
+NUM_RE = re.compile(r"\d+")
 
-    if not log_data: return pd.DataFrame()
+STOPWORDS_BASE = set("""de da do das dos e em a o os as na no para por com que ao aos às à um uma umas uns tipo titulo inteiro teor publicado publicacao disponibilizacao orgao vara tribunal processo recurso intimacao notificacao justica nacional diario djen poder judiciario trabalho""".split())
 
-    df = pd.DataFrame(log_data)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    if start_date: df = df[df['timestamp'].dt.date >= start_date]
-    if end_date: df = df[df['timestamp'].dt.date <= end_date]
-    if search_term:
-        term = search_term.lower()
-        df = df[df.apply(lambda row: term in str(row['usuario']).lower() or term in str(row['acao']).lower() or term in str(row['detalhes']).lower(), axis=1)]
-        
-    return df.head(200)
+def extract_cnj(text: str) -> Optional[str]:
+    m = CNJ_RE.search(text or "")
+    return m.group(1) if m else None
 
-def log_action_firestore(db, user: str, action: str, details: dict):
-    """Insere uma nova entrada na coleção de log do Firestore."""
-    try:
-        log_entry = {
-            "timestamp": datetime.now(TZ_UTC),
-            "usuario": user,
-            "acao": action,
-            "detalhes": json.dumps(details)
-        }
-        db.collection('log_auditoria_duplicatas').add(log_entry)
-        carregar_log_firestore.clear()
-    except Exception as e:
-        logging.error(f"Falha ao registrar log no Firestore: {e}")
+def extract_meta(text: str) -> Dict[str, str]:
+    t = text or ""
+    meta = {}
+    # Processo/CNJ
+    cnj = extract_cnj(t)
+    if not cnj:
+        m = re.search(r"PROCESSO:\s*([0-9\-.]+)", t, re.IGNORECASE)
+        if m: cnj = m.group(1)
+    meta["processo"] = cnj or ""
 
-# ==============================================================================
-# 6. AGRUPAMENTO COM PENALIZAÇÃO POR CONTEÚDO EXTRA
-# ==============================================================================
+    # Órgão/Vara/Tipo
+    m = re.search(r"\bORGAO:\s*([^-\n\r]+)", t, re.IGNORECASE)
+    if m: meta["orgao"] = m.group(1).strip()
+    m = re.search(r"\bVARA\s+DO\s+TRABALHO\s+[^-\n\r]+", t, re.IGNORECASE)
+    if m: meta["vara"] = m.group(0).strip()
+    m = re.search(r"\bTIPO\s+DE\s+DOCUMENTO:\s*([^-]+)", t, re.IGNORECASE)
+    if m: meta["tipo_doc"] = m.group(1).strip()
+    m = re.search(r"\bTIPO\s+DE\s+COMUNICACAO:\s*([^-]+)", t, re.IGNORECASE)
+    if m: meta["tipo_com"] = m.group(1).strip()
+    return meta
 
-def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
-    """Agrupa duplicatas por pasta com duas etapas:
-       1) Candidatos rápidos via token_set (RapidFuzz, C-level)
-       2) Validação com score combinado + containment mínimo"""
-    if df.empty:
-        return []
+def normalize_for_match(text: str, stopwords_extra: List[str] | None = None) -> str:
+    if not isinstance(text, str): return ""
+    t = text
+    t = URL_RE.sub(" url ", t)
+    t = CNJ_RE.sub(" numproc ", t)
+    t = DATENUM_RE.sub(" data ", t)
+    t = NUM_RE.sub(" # ", t)
+    t = unidecode(t.lower())
+    t = re.sub(r"[^\w\s]", " ", t)
+    tokens = [w for w in t.split() if w not in STOPWORDS_BASE and (not stopwords_extra or w not in stopwords_extra)]
+    return " ".join(tokens)
 
-    df = df.copy()
-    cutoff = int(min_sim * 100)
-    pre_cutoff = max(60, cutoff - SIM_PRE_CUTOFF_DELTA)
+def token_containment(a_tokens: List[str], b_tokens: List[str]) -> float:
+    if not a_tokens or not b_tokens: return 0.0
+    if len(a_tokens) <= len(b_tokens):
+        small, big = a_tokens, set(b_tokens)
+    else:
+        small, big = b_tokens, set(a_tokens)
+    hits = sum(1 for w in small if w in big)
+    return 100.0 * (hits / max(1, len(small)))
 
-    # Assinatura de cache inclui id, pasta e fingerprint do texto (len) + limiar e parâmetros de sim
-    sig = (
-        tuple(sorted((row["activity_id"], row.get("activity_folder") or "", int(row.get("prep_len",0)))
-                     for _, row in df.iterrows())),
-        cutoff, pre_cutoff, SIM_MIN_CONTAINMENT
-    )
+def fields_bonus(meta_a: Dict[str,str], meta_b: Dict[str,str]) -> int:
+    bonus = 0
+    if meta_a.get("processo") and meta_a.get("processo") == meta_b.get("processo"):
+        bonus += 6
+    if meta_a.get("orgao") and meta_a.get("orgao") == meta_b.get("orgao"):
+        bonus += 3
+    if meta_a.get("tipo_doc") and meta_a.get("tipo_doc") == meta_b.get("tipo_doc"):
+        bonus += 3
+    if meta_a.get("tipo_com") and meta_a.get("tipo_com") == meta_b.get("tipo_com"):
+        bonus += 2
+    return bonus
+
+def length_penalty(a: str, b: str) -> float:
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0: return 0.8
+    diff = abs(la - lb) / max(la, lb)
+    # penaliza até 10%
+    return max(0.9, 1.0 - diff * 0.5)
+
+def combined_score(a_norm: str, b_norm: str, meta_a: Dict[str,str], meta_b: Dict[str,str]) -> Tuple[float, Dict[str,float]]:
+    set_ratio = fuzz.token_set_ratio(a_norm, b_norm)
+    sort_ratio = fuzz.token_sort_ratio(a_norm, b_norm)
+    a_toks = a_norm.split(); b_toks = b_norm.split()
+    cont = token_containment(a_toks, b_toks)
+    lp = length_penalty(a_norm, b_norm)
+    bonus = fields_bonus(meta_a, meta_b)
+    base = 0.6*set_ratio + 0.2*sort_ratio + 0.2*cont
+    score = max(0.0, min(100.0, base * lp + bonus))
+    details = {"set": set_ratio, "sort": sort_ratio, "contain": cont, "len_pen": lp, "bonus": bonus, "base": base}
+    return score, details
+
+# =============================================================================
+# Agrupamento
+# =============================================================================
+
+def build_buckets(df: pd.DataFrame, use_cnj: bool, use_datajuri: bool, dj_client: Optional[DataJuriClient]) -> Dict[str, List[int]]:
+    """
+    Retorna dict bucket_key -> list(row_index)
+    - Sempre agrupa por activity_folder
+    - Se use_cnj: sub-bucket por CNJ extraído
+    - Se use_datajuri: tenta Pasta real via DataJuri
+    """
+    buckets = defaultdict(list)
+    for i, row in df.iterrows():
+        folder = str(row.get("activity_folder") or "")
+        text = row.get("Texto") or ""
+        meta = row.get("_meta", {})
+        cnj = meta.get("processo") or extract_cnj(text) or ""
+        key = f"folder::{folder}"
+        # DataJuri: substitui bucket pelo nome da Pasta, se disponível
+        if use_datajuri and dj_client and cnj:
+            try:
+                pasta = dj_client.get_pasta_by_cnj_cached(cnj)
+                if pasta:
+                    key = f"pasta::{pasta}"
+            except Exception:
+                pass
+        elif use_cnj:
+            key = f"{key}::cnj::{cnj or 'SEM_CNJ'}"
+        buckets[key].append(i)
+    return buckets
+
+def criar_grupos_de_duplicatas(df: pd.DataFrame,
+                               min_sim: float,
+                               min_containment: float,
+                               pre_cutoff_delta: int,
+                               use_cnj: bool,
+                               use_datajuri: bool,
+                               dj_client: Optional[DataJuriClient],
+                               stopwords_extra: Optional[List[str]] = None) -> List[List[Dict]]:
+    """
+    Retorna lista de grupos (cada grupo é lista de dicts de linhas do df).
+    Respeita cutoffs por pasta definidos em st.secrets['similarity']['cutoffs_por_pasta'].
+    """
+    if df.empty: return []
+    # Cache control
+    sig = (tuple(sorted(df["activity_id"])), round(min_sim,3), round(min_containment,3), pre_cutoff_delta, use_cnj, use_datajuri, "cutoffs_v1")
     cached = st.session_state.get(SK.SIMILARITY_CACHE)
     if cached and cached.get("sig") == sig:
         return cached["groups"]
 
+    work = df.copy()
+    # precompute meta & norms
+    stop_extras = [s.strip() for s in st.secrets.get("similarity", {}).get("stopwords_extra", [])] if stopwords_extra is None else stopwords_extra
+    work["_meta"] = work["Texto"].apply(extract_meta)
+    work["_norm"] = work["Texto"].apply(lambda t: normalize_for_match(t, stop_extras))
+
+    # bucketing
+    buckets = build_buckets(work, use_cnj=use_cnj, use_datajuri=use_datajuri, dj_client=dj_client)
+
+    # cutoffs por pasta
+    cutoffs_map = st.secrets.get("similarity", {}).get("cutoffs_por_pasta", {}) or {}
+
     groups = []
-    ph = st.sidebar.empty()
-    pb = ph.progress(0, text="Agrupando duplicatas...")
+    # Barra de progresso
+    ph = st.sidebar.empty(); pb = ph.progress(0, text="Agrupando duplicatas...")
+    processed = 0; total = len(work)
 
-    total_processado = 0
-    for folder, dff in df.groupby("activity_folder", dropna=False):
+    def eff_threshold_for_bucket(bkey: str) -> float:
+        # bkey: "folder::<folder>::cnj::<n>" ou "pasta::<pasta>"
+        if bkey.startswith("folder::"):
+            folder = bkey.split("::")[1]
+            return float(cutoffs_map.get(folder, min_sim))
+        elif bkey.startswith("pasta::"):
+            pasta = bkey.split("::", 1)[1]
+            return float(cutoffs_map.get(pasta, min_sim))
+        return min_sim
+
+    for bkey, idxs in buckets.items():
+        if len(idxs) < 2:
+            processed += len(idxs); pb.progress(min(1.0, processed/total)); continue
+
+        dff = work.loc[idxs].reset_index(drop=False).rename(columns={"index":"orig_idx"})
+        texts = dff["_norm"].tolist()
+
+        # thresholds para este bucket
+        eff_min = eff_threshold_for_bucket(bkey)
+        pre_cut = max(0, int(eff_min*100) - pre_cutoff_delta)
+
+        # Pré filtro com cdist no token_set_ratio
+        prelim = process.cdist(texts, texts, scorer=fuzz.token_set_ratio, score_cutoff=pre_cut)
         n = len(dff)
-        if n < 2:
-            total_processado += n
-            continue
+        visited = set()
+        memo_score: Dict[Tuple[int,int], Tuple[float,Dict[str,float]]] = {}
 
-        texts = dff["prep_text"].tolist()
-        sets_list = dff["prep_set"].tolist()
+        def edge_ok(i,j) -> bool:
+            key = (i,j) if i<=j else (j,i)
+            if key in memo_score: s, det = memo_score[key]
+            else:
+                s, det = combined_score(dff.loc[i, "_norm"], dff.loc[j, "_norm"], dff.loc[i, "_meta"], dff.loc[j, "_meta"])
+                memo_score[key] = (s, det)
+            if det["contain"] < min_containment: return False
+            return s >= (eff_min*100.0)
 
-        # Matriz rápida para cortar pares óbvios
-        sim_fast = process.cdist(texts, texts, scorer=fuzz.token_set_ratio, score_cutoff=pre_cutoff)
-
-        visitados = set()
         for i in range(n):
-            if i in visitados: continue
-            comp = {i}
-            fila = deque([i])
-            visitados.add(i)
-            while fila:
-                k = fila.popleft()
+            if i in visited: continue
+            comp = {i}; dq = deque([i]); visited.add(i)
+            while dq:
+                k = dq.popleft()
                 for j in range(n):
-                    if j in visitados: 
-                        continue
-                    if sim_fast[k][j] < pre_cutoff:
-                        continue
-                    # Validação mais rigorosa
-                    score, breakdown = _combined_similarity(dff.iloc[k]["Texto"], dff.iloc[j]["Texto"])
-                    # containment direto via sets (mais barato e consistente)
-                    sa, sb = sets_list[k], sets_list[j]
-                    contain = int(100 * (len(sa & sb) / max(1, max(len(sa), len(sb)))))
-                    if score >= cutoff and contain >= SIM_MIN_CONTAINMENT:
-                        visitados.add(j); comp.add(j); fila.append(j)
-
+                    if j in visited: continue
+                    if prelim[k][j] >= pre_cut and edge_ok(k,j):
+                        visited.add(j); comp.add(j); dq.append(j)
             if len(comp) > 1:
-                comp_idxs = sorted(list(comp), key=lambda idx: dff.iloc[idx]["activity_date"], reverse=True)
-                groups.append([dff.iloc[idx].to_dict() for idx in comp_idxs])
+                comp_idxs = sorted(list(comp), key=lambda ix: dff.loc[ix, "activity_date"] if pd.notna(dff.loc[ix, "activity_date"]) else pd.Timestamp(0), reverse=True)
+                groups.append([work.iloc[dff.loc[ix, "orig_idx"]].to_dict() for ix in comp_idxs])
 
-        total_processado += n
-        pb.progress(min(1.0, total_processado / len(df)), text="Analisando pastas...")
+        processed += len(idxs)
+        pb.progress(min(1.0, processed/total), text=f"Agrupando (bucket {bkey})...")
     ph.empty()
+
     st.session_state[SK.SIMILARITY_CACHE] = {"sig": sig, "groups": groups}
     return groups
 
-# ==============================================================================
-# 7. COMPONENTES DE UI
-# ==============================================================================
+# =============================================================================
+# Diff seguro (evita travar)
+# =============================================================================
 
-def renderizar_sidebar(df_completo: pd.DataFrame) -> dict:
-    st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
-    if st.sidebar.button("Logout"):
-        st.session_state.clear(); st.rerun()
+def highlight_diffs_safe(text1: str, text2: str, hard_limit: int = 12000) -> Tuple[str,str]:
+    t1, t2 = text1 or "", text2 or ""
+    if (len(t1) + len(t2)) <= hard_limit:
+        return highlight_diffs(t1, t2)
+    # fallback por sentença / blocos
+    def split_sentences(t: str, max_parts=400):
+        parts = re.split(r"([.!?\\n]+)", t)
+        # recombina mantendo pontuação
+        seq = []
+        for i in range(0, len(parts), 2):
+            seg = parts[i]
+            sep = parts[i+1] if i+1 < len(parts) else ""
+            seq.append((seg+sep).strip())
+            if len(seq) >= max_parts: break
+        return seq
+    s1 = " ".join(split_sentences(t1))
+    s2 = " ".join(split_sentences(t2))
+    h1, h2 = highlight_diffs(s1, s2)
+    note = "<div class='small-muted'>⚠️ Diff parcial por tamanho — comparado por sentenças.</div>"
+    return (note + h1, note + h2)
 
+def highlight_diffs(a: str, b: str) -> Tuple[str,str]:
+    tokens1 = [tok for tok in re.split(r'(\W+)', a or "") if tok]
+    tokens2 = [tok for tok in re.split(r'(\W+)', b or "") if tok]
+    sm = SequenceMatcher(None, tokens1, tokens2, autojunk=False)
+    out1, out2 = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        s1, s2 = html.escape("".join(tokens1[i1:i2])), html.escape("".join(tokens2[j1:j2]))
+        if tag == 'equal': out1.append(s1); out2.append(s2)
+        elif tag == 'replace': out1.append(f"<span class='diff-del'>{s1}</span>"); out2.append(f"<span class='diff-ins'>{s2}</span>")
+        elif tag == 'delete': out1.append(f"<span class='diff-del'>{s1}</span>")
+        elif tag == 'insert': out2.append(f"<span class='diff-ins'>{s2}</span>")
+    return (f"<pre class='highlighted-text'>{''.join(out1)}</pre>", f"<pre class='highlighted-text'>{''.join(out2)}</pre>")
+
+def as_sp(ts: any) -> Optional[datetime]:
+    if pd.isna(ts): return None
+    if isinstance(ts, str): ts = pd.to_datetime(ts)
+    if isinstance(ts, (int, float)): ts = pd.to_datetime(ts, unit='s')
+    if ts.tzinfo is None: ts = ts.tz_localize(TZ_UTC)
+    return ts.tz_convert(TZ_SP)
+
+# =============================================================================
+# Sidebar / Filtros
+# =============================================================================
+
+def sidebar_controls(df_full: pd.DataFrame) -> Dict:
+    st.sidebar.header("Sessão")
+    if st.session_state.get(SK.USERNAME):
+        st.sidebar.success(f"Logado como **{st.session_state[SK.USERNAME]}**")
     if st.sidebar.button("🔄 Atualizar dados"):
         st.session_state.pop(SK.SIMILARITY_CACHE, None)
-        st.session_state.pop(SK.GROUP_STATES, None)
-        st.session_state[SK.PAGE_NUMBER] = 1
         carregar_dados_mysql.clear()
 
-    st.sidebar.header("Filtros")
+    st.sidebar.header("Parâmetros de Similaridade")
+    sim_cfg = st.secrets.get("similarity", {})
+    min_sim = st.sidebar.slider("Similaridade mínima (%)", 0, 100, int(sim_cfg.get("min_sim_global", DEFAULTS["min_sim_global"])), 1) / 100.0
+    min_containment = st.sidebar.slider("Containment mínimo (%)", 0, 100, int(sim_cfg.get("min_containment", DEFAULTS["min_containment"])), 1)
+    pre_delta = st.sidebar.slider("Pré‑corte (delta)", 0, 30, int(sim_cfg.get("pre_cutoff_delta", DEFAULTS["pre_cutoff_delta"])), 1)
+    diff_limit = st.sidebar.number_input("Limite duro do Diff (caracteres)", min_value=3000, value=int(sim_cfg.get("diff_hard_limit", DEFAULTS["diff_hard_limit"])), step=1000)
 
-    # Widgets com chaves fixas para permitir reidratação
-    dias_historico = st.sidebar.number_input(
-        "Dias para Comparação", min_value=7, value=st.session_state.get("k_dias_historico", 90), step=1, key="k_dias_historico"
+    st.sidebar.subheader("Escopo da comparação")
+    dias_hist = st.sidebar.number_input("Dias de histórico", min_value=7, value=90, step=1)
+    data_inicio = st.sidebar.date_input("Data Início", date.today()-timedelta(days=DEFAULTS["dias_filtro_inicio"]))
+    data_fim = st.sidebar.date_input("Data Fim", date.today()+timedelta(days=DEFAULTS["dias_filtro_fim"]))
+    pastas_opts = sorted(df_full["activity_folder"].dropna().unique()) if not df_full.empty else []
+    status_opts = sorted(df_full["activity_status"].dropna().unique()) if not df_full.empty else []
+    pastas_sel = st.sidebar.multiselect("Pastas", pastas_opts)
+    status_sel = st.sidebar.multiselect("Status", status_opts)
+
+    st.sidebar.subheader("Pré‑índice")
+    use_cnj = st.sidebar.toggle("Restringir por nº do processo (CNJ)", value=True)
+    use_datajuri = st.sidebar.toggle("Usar DataJuri p/ Pasta", value=False if datajuri_client() is None else True)
+    st.sidebar.caption("Se ligado, só compara documentos com o mesmo CNJ ou mesma Pasta DataJuri.")
+
+    st.sidebar.subheader("API de Cancelamento")
+    dry_run = st.sidebar.toggle("Dry‑run (não chama a API real)", value=bool(st.secrets.get("api_client", {}).get("dry_run", False)))
+    st.session_state[SK.CFG]["dry_run"] = dry_run
+
+    # Regras por pasta (informativas)
+    st.sidebar.subheader("Regras por Pasta (secrets)")
+    cutoffs_por_pasta = st.secrets.get("similarity", {}).get("cutoffs_por_pasta", {})
+    if cutoffs_por_pasta:
+        st.sidebar.json(cutoffs_por_pasta, expanded=False)
+
+    return dict(
+        min_sim=min_sim, min_containment=min_containment, pre_delta=pre_delta,
+        diff_limit=diff_limit, dias_hist=dias_hist, data_inicio=data_inicio, data_fim=data_fim,
+        pastas=pastas_sel, status=status_sel, use_cnj=use_cnj, use_datajuri=use_datajuri
     )
-    data_inicio = st.sidebar.date_input(
-        "Data Início", st.session_state.get("k_data_inicio", date.today() - timedelta(days=DIAS_FILTRO_PADRAO_INICIO)), key="k_data_inicio"
-    )
-    data_fim = st.sidebar.date_input(
-        "Data Fim", st.session_state.get("k_data_fim", date.today() + timedelta(days=DIAS_FILTRO_PADRAO_FIM)), key="k_data_fim"
-    )
 
-    pastas_opts = sorted(df_completo["activity_folder"].dropna().unique()) if not df_completo.empty else []
-    status_opts = sorted(df_completo["activity_status"].dropna().unique()) if not df_completo.empty else []
+# =============================================================================
+# UI de grupos
+# =============================================================================
 
-    pastas = st.sidebar.multiselect("Pastas", pastas_opts, default=st.session_state.get("k_pastas", []), key="k_pastas")
-    status = st.sidebar.multiselect("Status", status_opts, default=st.session_state.get("k_status", []), key="k_status")
-    min_sim = st.sidebar.slider("Similaridade Mínima (%)", 0, 100, st.session_state.get("k_min_sim", 90), 1, key="k_min_sim") / 100
+def color_for_badge(score: float, min_sim_pct: float) -> str:
+    if score >= (min_sim_pct + 5): return "badge-green"
+    if score >= (min_sim_pct): return "badge-yellow"
+    return "badge-red"
 
-    # Salvar/Carregar
-    st.sidebar.subheader("Salvar/Carregar Filtros")
-    saved_filters = st.session_state[SK.SAVED_FILTERS]
-    filter_name = st.sidebar.text_input("Nome para salvar filtro")
-    if st.sidebar.button("Salvar Filtros Atuais") and filter_name:
-        saved_filters[filter_name] = {
-            "k_dias_historico": dias_historico,
-            "k_data_inicio": data_inicio,
-            "k_data_fim": data_fim,
-            "k_pastas": pastas,
-            "k_status": status,
-            "k_min_sim": int(min_sim * 100),
-        }
-        st.sidebar.success(f"Filtro '{filter_name}' salvo!")
-
-    if saved_filters:
-        selected_filter = st.sidebar.selectbox("Carregar Filtro Salvo", [""] + list(saved_filters.keys()))
-        if selected_filter:
-            f = saved_filters[selected_filter]
-            st.session_state["k_dias_historico"] = f.get("k_dias_historico", 90)
-            st.session_state["k_data_inicio"] = f.get("k_data_inicio")
-            st.session_state["k_data_fim"] = f.get("k_data_fim")
-            st.session_state["k_pastas"] = f.get("k_pastas", [])
-            st.session_state["k_status"] = f.get("k_status", [])
-            st.session_state["k_min_sim"] = f.get("k_min_sim", 90)
-            st.sidebar.success("Filtros aplicados.")
-            st.session_state[SK.PAGE_NUMBER] = 1
-            st.rerun()
-
-    return {
-        "dias_historico": st.session_state["k_dias_historico"],
-        "data_inicio": st.session_state["k_data_inicio"],
-        "data_fim": st.session_state["k_data_fim"],
-        "pastas": st.session_state.get("k_pastas", []),
-        "status": st.session_state.get("k_status", []),
-        "min_sim": st.session_state.get("k_min_sim", 90) / 100,
-    }
-
-def renderizar_grupo_duplicatas(group_data: list, expand: bool = False):
-    # chave do estado do grupo baseada no primeiro id (como antes)
-    group_id = group_data[0]['activity_id']
-    group_state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
-        "principal_id": group_data[0]['activity_id'], "cancelados": set(), "comparacao_aberta": None
+def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int):
+    group_id = group_rows[0]["activity_id"]
+    state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
+        "principal_id": group_rows[0]["activity_id"],
+        "open_compare": None,
+        "cancelados": set()
     })
 
-    with st.expander(f"Grupo de Duplicatas ({len(group_data)} atividades) - Pasta: {group_data[0]['activity_folder']}", expanded=expand):
-        # Localiza dados da principal atual
-        principal_data = next(item for item in group_data if item['activity_id'] == group_state["principal_id"])
+    with st.expander(f"Grupo com {len(group_rows)} itens — Pasta: {group_rows[0].get('activity_folder','')}", expanded=False):
+        # Mapa de metas e norms para o principal
+        principal = next(r for r in group_rows if r["activity_id"] == state["principal_id"])
+        p_meta = extract_meta(principal.get("Texto","")); p_norm = normalize_for_match(principal.get("Texto",""))
+        min_sim_abs = min_sim_pct
 
-        for item_data in group_data:
-            item_id = item_data['activity_id']
-            is_principal = (item_id == group_state["principal_id"])
-            is_cancelado = (item_id in group_state["cancelados"])
+        for row in group_rows:
+            rid = row["activity_id"]
+            is_principal = (rid == state["principal_id"])
+            is_open = (rid == state["open_compare"])
+            is_cancel = (rid in state["cancelados"])
 
-            # Similaridade vs principal (100% para a própria principal)
-            if is_principal:
-                sim_pct, breakdown = 100, {"set":100,"tok":100,"containment":100,"len_pen":100,"jaccard":100}
-            else:
-                sim_pct, breakdown = _combined_similarity(principal_data['Texto'], item_data['Texto'])
-            badge = similarity_badge(int(sim_pct), "Similaridade c/ principal", breakdown)
-
-            card_class = "card-principal" if is_principal else "card-cancelado" if is_cancelado else ""
+            card_class = "card-principal" if is_principal else ("card-cancelado" if is_cancel else "")
             st.markdown(f"<div class='{card_class}'>", unsafe_allow_html=True)
 
-            c1, c2 = st.columns([0.7, 0.3])
+            c1, c2 = st.columns([0.72, 0.28])
             with c1:
-                dt = as_sp(item_data["activity_date"])
-                st.markdown(
-                    f"**ID:** `{item_id}` "
-                    f"{'⭐ **Principal**' if is_principal else ''} "
-                    f"{'🗑️ **Cancelado**' if is_cancelado else ''} "
-                    f"{badge}",
-                    unsafe_allow_html=True
-                )
-                st.caption(f"**Data:** {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'} | "
-                           f"**Status:** {item_data['activity_status']} | "
-                           f"**Usuário:** {item_data['user_profile_name']}")
-                st.text_area("Texto", item_data['Texto'], height=80, disabled=True, key=f"text_{item_id}")
+                dt = as_sp(row.get("activity_date"))
+                st.markdown(f"**ID:** `{rid}` {'⭐ **Principal**' if is_principal else ''} {'🗑️ **Selecionado p/ cancelar**' if is_cancel else ''}")
+                st.caption(f"**Data:** {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'} | **Status:** {row.get('activity_status','')} | **Usuário:** {row.get('user_profile_name','')}")
+                # Badge de similaridade (somente se não for principal)
+                if not is_principal:
+                    r_norm = normalize_for_match(row.get("Texto",""))
+                    r_meta = extract_meta(row.get("Texto",""))
+                    s, det = combined_score(p_norm, r_norm, p_meta, r_meta)
+                    badge = color_for_badge(s, min_sim_abs)
+                    st.markdown(f"<span class='similarity-badge {badge}'>Similaridade: {int(round(s))}%</span>", unsafe_allow_html=True)
+                    st.caption(f"set={int(det['set'])} | sort={int(det['sort'])} | contain={int(det['contain'])} | len_pen={det['len_pen']:.2f} | bonus={det['bonus']}")
+                # Chips de metacampos
+                r_meta_show = extract_meta(row.get("Texto",""))
+                chips = []
+                if r_meta_show.get("processo"): chips.append(f"<span class='meta-chip'>Processo: {r_meta_show['processo']}</span>")
+                if r_meta_show.get("orgao"): chips.append(f"<span class='meta-chip'>Órgão: {r_meta_show['orgao']}</span>")
+                if r_meta_show.get("tipo_doc"): chips.append(f"<span class='meta-chip'>Tipo Doc: {r_meta_show['tipo_doc']}</span>")
+                if r_meta_show.get("tipo_com"): chips.append(f"<span class='meta-chip'>Tipo Com: {r_meta_show['tipo_com']}</span>")
+                if chips: st.markdown(" ".join(chips), unsafe_allow_html=True)
+
+                st.text_area("Texto", row.get("Texto",""), height=100, disabled=True, key=f"txt_{rid}")
 
             with c2:
-                if not is_principal and st.button("⭐ Tornar Principal", key=f"principal_{item_id}"):
-                    group_state["principal_id"] = item_id; st.rerun()
+                if not is_principal and st.button("⭐ Tornar Principal", key=f"mkp_{rid}"):
+                    state["principal_id"] = rid; state["open_compare"] = None; st.rerun()
 
-                # [GATING] Só mostra o checkbox DEPOIS de abrir a comparação
-                show_cancel = (group_state["comparacao_aberta"] == item_id)
-                if show_cancel and st.checkbox("Marcar para Cancelar", value=is_cancelado, key=f"cancel_{item_id}"):
-                    if not is_cancelado: group_state["cancelados"].add(item_id)
-                elif show_cancel and is_cancelado:
-                    # permitir desmarcar
-                    if not st.session_state.get(f"cancel_{item_id}"):
-                        group_state["cancelados"].discard(item_id)
+                if not is_principal and st.button("⚖️ Comparar com Principal", key=f"cmp_{rid}"):
+                    state["open_compare"] = rid; st.rerun()
 
-                if not is_principal and st.button("⚖ Comparar com Principal", key=f"compare_{item_id}"):
-                    group_state["comparacao_aberta"] = item_id; st.rerun()
+                # ⚠️ Checkbox aparece somente após abrir a comparação deste item
+                if not is_principal and is_open:
+                    ck = st.checkbox("🗑️ Marcar para Cancelar", value=is_cancel, key=f"cancel_{rid}")
+                    if ck: state["cancelados"].add(rid)
+                    else:  state["cancelados"].discard(rid)
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        if group_state["comparacao_aberta"]:
-            principal_data = next(item for item in group_data if item['activity_id'] == group_state["principal_id"])
-            comparado_data = next(item for item in group_data if item['activity_id'] == group_state["comparacao_aberta"])
+        if state["open_compare"]:
+            principal_row = next(r for r in group_rows if r["activity_id"] == state["principal_id"])
+            comparado_row = next(r for r in group_rows if r["activity_id"] == state["open_compare"])
             st.markdown("---")
-            # Badge de similaridade na área de comparação (com breakdown)
-            sim_pct, breakdown = _combined_similarity(principal_data['Texto'], comparado_data['Texto'])
-            badge = similarity_badge(int(sim_pct), "Similaridade (diff)", breakdown)
-            ctitle1, ctitle2 = st.columns(2)
-            ctitle1.markdown(f"**Principal: ID `{principal_data['activity_id']}`** {badge}", unsafe_allow_html=True)
-            ctitle2.markdown(f"**Comparado: ID `{comparado_data['activity_id']}`**", unsafe_allow_html=True)
-
-            with st.spinner("Calculando diferenças..."):
-                hA, hB = highlight_diffs(principal_data['Texto'], comparado_data['Texto'])
             c1, c2 = st.columns(2)
+            c1.markdown(f"**Principal: ID `{principal_row['activity_id']}`**")
+            c2.markdown(f"**Comparado: ID `{comparado_row['activity_id']}`**")
+            hA, hB = highlight_diffs_safe(principal_row.get("Texto",""), comparado_row.get("Texto",""), diff_limit)
             c1.markdown(hA, unsafe_allow_html=True)
             c2.markdown(hB, unsafe_allow_html=True)
-            if st.button("❌ Fechar Comparação", key=f"close_compare_{group_id}"):
-                group_state["comparacao_aberta"] = None; st.rerun()
+            if st.button("❌ Fechar comparação", key=f"close_{group_id}"):
+                state["open_compare"] = None; st.rerun()
 
-# ==============================================================================
-# 8. APLICAÇÃO PRINCIPAL
-# ==============================================================================
+# =============================================================================
+# Export e processamento
+# =============================================================================
 
-def app():
-    api_client = inicializar_api_client()
-    mysql_engine = db_engine_mysql()
-    firestore_db = initialize_firebase()
+def export_groups_csv(groups: List[List[Dict]]) -> bytes:
+    rows = []
+    for g in groups:
+        for r in g:
+            rows.append({
+                "group_size": len(g),
+                "activity_id": r.get("activity_id"),
+                "activity_folder": r.get("activity_folder"),
+                "activity_date": r.get("activity_date"),
+                "activity_status": r.get("activity_status"),
+                "user_profile_name": r.get("user_profile_name"),
+                "Texto": r.get("Texto","")
+            })
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
-    # Carrega base histórica ampla (para popular filtros)
-    df_completo = carregar_dados_mysql(mysql_engine, st.session_state.get("k_dias_historico", 90))
+def process_actions(groups: List[List[Dict]], user: str):
+    cli = api_client()
+    if cli is None:
+        st.error("Cliente de API não configurado (api_functions_retry.HttpClientRetry indisponível ou secrets incompletos).")
+        return
+    dry_run = st.session_state[SK.CFG].get("dry_run", False)
+    total = 0; ok = 0; errs = 0
+    for g in groups:
+        gid = None
+        # encontra estado do grupo pela primeira activity_id
+        gid = g[0]["activity_id"]
+        state = st.session_state[SK.GROUP_STATES].get(gid, {})
+        canc = state.get("cancelados", set())
+        if not canc: continue
+        for rid in list(canc):
+            total += 1
+            resp = cli.activity_canceled(activity_id=rid, user_name=user)
+            if resp and isinstance(resp, dict) and (resp.get("ok") or resp.get("success") or resp.get("status") in (200,201)):
+                ok += 1
+            elif dry_run:
+                ok += 1
+            else:
+                errs += 1
+    if ok and not errs:
+        st.success(f"Ações processadas com sucesso: {ok}/{total}.")
+    elif ok:
+        st.warning(f"Ações parcialmente concluídas: {ok}/{total} com {errs} erros.")
+    else:
+        st.error("Falha ao processar as ações.")
 
-    filtros = renderizar_sidebar(df_completo)
+# =============================================================================
+# Calibração (histograma)
+# =============================================================================
 
-    # Recarrega conforme dias_historico atual
-    df_completo = carregar_dados_mysql(mysql_engine, filtros['dias_historico'])
-    if df_completo.empty:
+def render_calibration(df: pd.DataFrame, use_cnj: bool, use_datajuri: bool, dj_client: Optional[DataJuriClient]):
+    st.subheader("📊 Calibração de Similaridade")
+    pasta = st.selectbox("Selecione uma pasta (activity_folder) para amostragem:", sorted(df["activity_folder"].dropna().unique()))
+    amostras = st.slider("Amostras (pares aleatórios)", 50, 1000, 200, 50)
+    min_cont = st.slider("Containment mínimo para considerar no gráfico (%)", 0, 100, 0, 1)
+
+    sample_df = df[df["activity_folder"]==pasta].copy()
+    if len(sample_df) < 2:
+        st.info("Pasta com menos de 2 itens.")
+        return
+
+    # prepara norms/meta
+    stop_extras = [s.strip() for s in st.secrets.get("similarity", {}).get("stopwords_extra", [])]
+    sample_df["_meta"] = sample_df["Texto"].apply(extract_meta)
+    sample_df["_norm"] = sample_df["Texto"].apply(lambda t: normalize_for_match(t, stop_extras))
+
+    # pega pares aleatórios
+    idxs = sample_df.index.tolist()
+    rng = np.random.default_rng(42)
+    pairs = set()
+    while len(pairs) < min(amostras, (len(idxs)*(len(idxs)-1))//2):
+        i, j = tuple(rng.choice(idxs, size=2, replace=False))
+        a = min(i,j); b = max(i,j)
+        if a!=b: pairs.add((a,b))
+
+    scores = []
+    for a,b in pairs:
+        s, det = combined_score(sample_df.at[a,"_norm"], sample_df.at[b,"_norm"], sample_df.at[a,"_meta"], sample_df.at[b,"_meta"])
+        if det["contain"] >= min_cont:
+            scores.append({"score": s, "set": det["set"], "sort": det["sort"], "contain": det["contain"]})
+
+    if not scores:
+        st.info("Nenhum par após o filtro de containment.")
+        return
+    df_scores = pd.DataFrame(scores)
+
+    st.write("Estatísticas:", df_scores.describe()[["score","contain"]])
+
+    if alt is not None:
+        chart = alt.Chart(df_scores).mark_bar().encode(
+            x=alt.X("score:Q", bin=alt.Bin(maxbins=30)),
+            y="count()"
+        ).properties(height=240)
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.line_chart(df_scores["score"])
+
+# =============================================================================
+# App principal
+# =============================================================================
+
+def main():
+    _init_session_state()
+    st.title(APP_TITLE)
+
+    # (Opcional) login muito simples para registrar usuário executor
+    with st.sidebar.expander("Login (opcional)"):
+        u = st.text_input("Usuário")
+        if st.button("Entrar"):
+            st.session_state[SK.USERNAME] = u or "usuário"
+            st.success(f"Logado como {st.session_state[SK.USERNAME]}")
+
+    eng = db_engine_mysql()
+    df_full = carregar_dados_mysql(eng, 90)
+
+    cfg = sidebar_controls(df_full)
+
+    df = carregar_dados_mysql(eng, cfg["dias_hist"])
+    if df.empty:
         st.warning("Nenhuma atividade encontrada para o período.")
         st.stop()
 
-    tab_principal, tab_log = st.tabs(["🔎 Análise de Duplicidades", "📜 Histórico de Ações"])
+    # Aplicar filtros de visualização
+    mask = pd.Series(True, index=df.index)
+    if cfg["pastas"]:
+        mask &= df["activity_folder"].isin(cfg["pastas"])
+    if cfg["status"]:
+        mask &= df["activity_status"].isin(cfg["status"])
+    if cfg["data_inicio"]:
+        mask &= (df["activity_date"].dt.date >= cfg["data_inicio"])
+    if cfg["data_fim"]:
+        mask &= (df["activity_date"].dt.date <= cfg["data_fim"])
+    df_view = df[mask].copy()
 
-    with tab_principal:
-        # --------- Escopo: Comparação Histórica Ampla ---------
-        # Filtros de pasta/status aplicam-se à base para comparação
-        df_base = df_completo.copy()
-        if filtros['pastas']:
-            df_base = df_base[df_base['activity_folder'].isin(filtros['pastas'])]
-        if filtros['status']:
-            df_base = df_base[df_base['activity_status'].isin(filtros['status'])]
+    # Tabs
+    t1, t2 = st.tabs(["🔎 Análise de Duplicidades", "📊 Calibração"])
 
-        # Define ids "recentes" apenas para o que será exibido
-        mask_recente = df_base['activity_date'].dt.date.between(filtros['data_inicio'], filtros['data_fim'])
-        ids_recente = set(df_base.loc[mask_recente, 'activity_id'])
+    with t1:
+        st.info("Dica: para marcar cancelamento, **abra a comparação** do item primeiro.")
+        groups = criar_grupos_de_duplicatas(df, cfg["min_sim"], cfg["min_containment"], cfg["pre_delta"], cfg["use_cnj"], cfg["use_datajuri"], datajuri_client())
 
-        # Agrupamento considera RECENTE + HISTÓRICO (com validação rigorosa)
-        grupos_todos = criar_grupos_de_duplicatas(df_base, filtros["min_sim"])
+        # Mostra só grupos que contenham alguma atividade dentro do período/filters
+        def group_visible(g):
+            ids = {r["activity_id"] for r in g}
+            sub = df_view[df_view["activity_id"].isin(ids)]
+            return not sub.empty
+        visible_groups = [g for g in groups if group_visible(g)]
 
-        # Exibir apenas grupos que toquem o período recente
-        grupos_duplicados = [g for g in grupos_todos if any(item['activity_id'] in ids_recente for item in g)]
+        # Paginação
+        page_size = st.number_input("Itens por página (grupos)", min_value=1, value=DEFAULTS["itens_por_pagina"], step=1)
+        total_pages = max(1, math.ceil(len(visible_groups)/page_size))
+        page = st.number_input("Página", min_value=1, max_value=total_pages, value=1, step=1)
+        start = (page-1)*page_size; end = start + page_size
+        st.caption(f"Exibindo grupos {start+1}–{min(end, len(visible_groups))} de {len(visible_groups)}")
 
-        # Sincroniza estado se necessário
-        if st.session_state.get(SK.GROUP_STATES) and not grupos_duplicados:
-            st.session_state[SK.GROUP_STATES] = {}
+        for g in visible_groups[start:end]:
+            render_group(g, cfg["min_sim"]*100.0, cfg["diff_limit"])
 
-        header_c1, header_c2, header_c3 = st.columns([4, 1, 1])
-        header_c1.markdown(f"### {len(grupos_duplicados)} Grupos de Duplicatas Encontrados")
+        col_a, col_b = st.columns([0.5,0.5])
+        with col_a:
+            csv_bytes = export_groups_csv(visible_groups)
+            st.download_button("⬇️ Exportar CSV (grupos visíveis)", data=csv_bytes, file_name="duplicatas.csv", mime="text/csv", use_container_width=True)
+        with col_b:
+            user = st.session_state.get(SK.USERNAME) or "usuario"
+            if st.button("🚀 Processar Ações (cancelamentos marcados)", type="primary", use_container_width=True):
+                process_actions(visible_groups, user)
 
-        # Processar ações: chama API e registra no Firestore
-        if header_c2.button("Processar Ações"):
-            resultados = {"principais": [], "cancelados_ok": [], "cancelados_fail": []}
-            usuario = st.session_state[SK.USERNAME]
-
-            for group_id, state in st.session_state[SK.GROUP_STATES].items():
-                # Cancelamentos via API + log no Firestore
-                for act_id in state['cancelados']:
-                    aid = _to_int(act_id)
-                    try:
-                        if aid is None:
-                            raise ValueError(f"ID inválido: {act_id}")
-                        resp = api_client.activity_canceled(aid, usuario)
-                        if isinstance(resp, dict) and resp.get("error"):
-                            resultados["cancelados_fail"].append({"id": act_id, "erro": resp["error"]})
-                            log_action_firestore(firestore_db, usuario, "Cancelamento(API-erro)",
-                                                 {"activity_id": act_id, "grupo": group_id, "erro": resp["error"]})
-                        elif resp:
-                            resultados["cancelados_ok"].append({"id": act_id, "resposta": resp})
-                            log_action_firestore(firestore_db, usuario, "Cancelamento(API)",
-                                                 {"activity_id": act_id, "grupo": group_id, "api_response": resp})
-                        else:
-                            resultados["cancelados_fail"].append({"id": act_id, "erro": "Sem resposta"})
-                            log_action_firestore(firestore_db, usuario, "Cancelamento(API-erro)",
-                                                 {"activity_id": act_id, "grupo": group_id, "erro": "Sem resposta"})
-                    except Exception as e:
-                        resultados["cancelados_fail"].append({"id": act_id, "erro": str(e)})
-                        log_action_firestore(firestore_db, usuario, "Cancelamento(API-erro)",
-                                             {"activity_id": act_id, "grupo": group_id, "erro": str(e)})
-
-                # Marcação de principal (apenas log permanente)
-                resultados["principais"].append(state['principal_id'])
-                log_action_firestore(firestore_db, usuario, "Marcar Principal",
-                                     {"activity_id": state['principal_id'], "grupo": group_id})
-
-            # Limpar e feedback
-            st.session_state[SK.GROUP_STATES] = {}
-            st.success(f"Principais: {len(resultados['principais'])} | "
-                       f"Canceladas OK: {len(resultados['cancelados_ok'])} | "
-                       f"Falhas: {len(resultados['cancelados_fail'])}")
-            with st.expander("Detalhes da execução"):
-                st.json(resultados)
-            st.rerun()
-
-        # Exportação
-        if grupos_duplicados:
-            export_data = [{"grupo_id": i + 1, **item} for i, group in enumerate(grupos_duplicados) for item in group]
-            df_export = pd.DataFrame(export_data)
-            header_c3.download_button("Exportar para CSV", df_to_csv(df_export), "relatorio_duplicatas.csv", "text/csv")
-
-        # --------- Paginação (sempre visível) ---------
-        if not grupos_duplicados:
-            st.info("Nenhum grupo de duplicatas encontrado para os filtros selecionados.")
-        else:
-            total = len(grupos_duplicados)
-            itens_por_pagina = st.session_state.get("k_itens_pagina", ITENS_POR_PAGINA)
-            col_a, col_b, col_c, col_d, col_e = st.columns([2,1,2,1,2])
-            with col_a:
-                itens_por_pagina = st.number_input("Itens/página", min_value=5, max_value=50,
-                                                   value=itens_por_pagina, step=5, key="k_itens_pagina")
-            page_count = max(1, (total + itens_por_pagina - 1) // itens_por_pagina)
-            current_page = st.session_state.get(SK.PAGE_NUMBER, 1)
-            current_page = min(max(1, current_page), page_count)
-            with col_b:
-                st.write("")
-                if st.button("◀️ Anterior", disabled=(current_page <= 1)):
-                    st.session_state[SK.PAGE_NUMBER] = max(1, current_page - 1)
-                    st.rerun()
-            with col_c:
-                current_page = st.number_input("Página", min_value=1, max_value=page_count,
-                                               value=current_page, step=1, key="k_page_num")
-                st.session_state[SK.PAGE_NUMBER] = current_page
-            with col_d:
-                st.write("")
-                if st.button("Próxima ▶️", disabled=(current_page >= page_count)):
-                    st.session_state[SK.PAGE_NUMBER] = min(page_count, current_page + 1)
-                    st.rerun()
-            with col_e:
-                expand_all = st.toggle("Expandir todos", value=st.session_state.get("k_expand_all", False), key="k_expand_all")
-
-            ini = (st.session_state[SK.PAGE_NUMBER] - 1) * itens_por_pagina
-            fim = ini + itens_por_pagina
-            st.caption(f"Mostrando grupos {ini+1}–{min(fim, total)} de {total}")
-            st.divider()
-
-            grupos_page = grupos_duplicados[ini:fim]
-            for i, grupo in enumerate(grupos_page):
-                renderizar_grupo_duplicatas(grupo, expand=expand_all)
-
-    with tab_log:
-        st.header("Histórico de Ações")
-        c1, c2, c3 = st.columns([2,1,1])
-        search_term = c1.text_input("Pesquisar por usuário, ação ou detalhes")
-        start_date = c2.date_input("De", None)
-        end_date = c3.date_input("Até", None)
-        
-        df_log = carregar_log_firestore(firestore_db, search_term, start_date, end_date)
-        if df_log.empty:
-            st.info("Nenhuma ação registrada para os filtros selecionados.")
-        else:
-            for entry in df_log.itertuples():
-                ts = entry.timestamp if isinstance(entry.timestamp, pd.Timestamp) else pd.to_datetime(entry.timestamp)
-                ts_fmt = (ts.tz_localize(TZ_UTC).tz_convert(TZ_SP).strftime('%d/%m/%Y %H:%M:%S')
-                          if ts.tzinfo is None else ts.tz_convert(TZ_SP).strftime('%d/%m/%Y %H:%M:%S'))
-                st.markdown(f"**Ação:** `{entry.acao}` | **Usuário:** `{entry.usuario}` | **Data:** `{ts_fmt}`")
-                try:
-                    st.json(json.loads(entry.detalhes) if isinstance(entry.detalhes, str) else entry.detalhes)
-                except Exception:
-                    st.write(entry.detalhes)
-                st.divider()
-
-# ==============================================================================
-# 9. LÓGICA DE LOGIN
-# ==============================================================================
-
-def cred_ok(u, p):
-    users = st.secrets.get("credentials", {}).get("usernames", {})
-    return u in users and str(users[u]) == p
-
-def login():
-    st.header("Login")
-    with st.form("login_form_main"):
-        username, password = st.text_input("Usuário"), st.text_input("Senha", type="password")
-        if st.form_submit_button("Entrar"):
-            if cred_ok(username, password):
-                st.session_state[SK.LOGGED_IN] = True; st.session_state[SK.USERNAME] = username
-                st.rerun()
-            else: st.error("Credenciais inválidas.")
-
-# ==============================================================================
-# PONTO DE ENTRADA PRINCIPAL
-# ==============================================================================
+    with t2:
+        render_calibration(df, cfg["use_cnj"], cfg["use_datajuri"], datajuri_client())
 
 if __name__ == "__main__":
-    inicializar_session_state()
-    (app() if st.session_state[SK.LOGGED_IN] else login())
+    main()
