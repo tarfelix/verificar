@@ -9,11 +9,12 @@ from unidecode import unidecode
 from rapidfuzz import fuzz, process
 from api_functions import HttpClient
 from difflib import SequenceMatcher
+from collections import deque # <--- 1. Importação para BFS otimizado
 
 # ==============================================================================
 # 1. CONFIGURAÇÕES E CONSTANTES GLOBAIS
 # ==============================================================================
-SUFFIX = "_v16_review"
+SUFFIX = "_v17_polished"
 
 class SK:
     LOGGED_IN = "logged_in"
@@ -100,7 +101,7 @@ def log_action(user: str, action: str, details: dict):
     st.session_state[SK.AUDIT_LOG].insert(0, log_entry)
 
 def df_to_csv(df: pd.DataFrame) -> bytes:
-    """Converte um DataFrame para uma string CSV para download."""
+    """Converte um DataFrame para bytes CSV para download.""" # <--- 4. Docstring corrigida
     return df.to_csv(index=False).encode('utf-8')
 
 # ==============================================================================
@@ -175,10 +176,10 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, min_sim: float) -> list:
                 continue
 
             comp = {i}
-            fila = [i]
+            fila = deque([i]) # <--- 1. Usando deque
             visitados.add(i)
             while fila:
-                k = fila.pop(0)
+                k = fila.popleft() # <--- 1. Usando popleft()
                 for j in range(n):
                     if j not in visitados and sim[k][j] >= cutoff:
                         visitados.add(j)
@@ -213,6 +214,7 @@ def renderizar_sidebar_primaria() -> dict:
         st.session_state[SK.LAST_UPDATE] = datetime.now(TZ_SP)
         carregar_dados.clear()
         st.session_state.pop(SK.SIMILARITY_CACHE, None)
+        st.session_state.pop(SK.GROUP_STATES, None) # <--- 2. Limpa estados de grupo
     
     up = st.session_state.get(SK.LAST_UPDATE) or datetime.now(TZ_SP)
     st.sidebar.caption(f"Dados de: {up:%d/%m/%Y %H:%M}")
@@ -332,6 +334,10 @@ def app():
         df_filtrado = df_filtrado[df_filtrado["activity_date"].dt.date.between(filtros["data_inicio"], filtros["data_fim"])]
 
         grupos_duplicados = criar_grupos_de_duplicatas(df_filtrado, filtros["min_sim"])
+        
+        # <--- 3. (Opcional) Limpa estados se não houver mais grupos
+        if st.session_state.get(SK.GROUP_STATES) and not grupos_duplicados:
+            st.session_state[SK.GROUP_STATES] = {}
 
         header_c1, header_c2, header_c3 = st.columns([4, 1, 1])
         header_c1.markdown(f"### {len(grupos_duplicados)} Grupos de Duplicatas Encontrados")
