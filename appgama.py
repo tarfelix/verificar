@@ -2,13 +2,15 @@
 """
 Verificador de Duplicidade — Upgrades Extras
 - Pré‑índice por CNJ e/ou Pasta (DataJuri opcional)
-- Cutoffs por pasta via st.secrets
+- Cutoffs por pasta via st.secrets (min_sim por pasta como FRAÇÃO, e.g. 0.92)
 - Histograma de similaridade para calibração
 - Retry/Rate‑limit/Dry‑run no client HTTP
 - Campos destacáveis (Processo/CNJ, Órgão, Tipo de Doc/Comunicação)
 - Badge com % de similaridade e tooltip com componentes
 - Diff adaptativo (não trava com textos muito grandes)
 - Checkbox “Marcar para cancelar” só aparece após abrir a comparação
+- NOVO: Exibição mínima (%) para esconder itens < limiar vs principal
+- NOVO: Botão “Definir melhor principal” (escolhe o hub do grupo)
 """
 from __future__ import annotations
 
@@ -300,6 +302,7 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame,
     """
     Retorna lista de grupos (cada grupo é lista de dicts de linhas do df).
     Respeita cutoffs por pasta definidos em st.secrets['similarity']['cutoffs_por_pasta'].
+    Observação: valores devem ser **frações** (0.92 para 92%).
     """
     if df.empty: return []
     # Cache control
@@ -317,7 +320,7 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame,
     # bucketing
     buckets = build_buckets(work, use_cnj=use_cnj, use_datajuri=use_datajuri, dj_client=dj_client)
 
-    # cutoffs por pasta
+    # cutoffs por pasta (mapa: nome -> FRAÇÃO)
     cutoffs_map = st.secrets.get("similarity", {}).get("cutoffs_por_pasta", {}) or {}
 
     groups = []
@@ -445,6 +448,13 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
     pre_delta = st.sidebar.slider("Pré‑corte (delta)", 0, 30, int(sim_cfg.get("pre_cutoff_delta", DEFAULTS["pre_cutoff_delta"])), 1)
     diff_limit = st.sidebar.number_input("Limite duro do Diff (caracteres)", min_value=3000, value=int(sim_cfg.get("diff_hard_limit", DEFAULTS["diff_hard_limit"])), step=1000)
 
+    # Guarda containment na sessão para heurística do "melhor principal"
+    st.session_state["cfg_vmin_cont"] = min_containment
+
+    # NOVO: Exibição mínima vs principal
+    view_min = st.sidebar.slider("Exibição mínima (%)", 0, 100, int(sim_cfg.get("min_sim_global", DEFAULTS["min_sim_global"])), 1)
+    show_low = st.sidebar.toggle("Mostrar itens abaixo da exibição mínima", value=False, help="Quando desligado, itens com similaridade ao principal abaixo do limiar serão ocultados na lista.")
+
     st.sidebar.subheader("Escopo da comparação")
     dias_hist = st.sidebar.number_input("Dias de histórico", min_value=7, value=90, step=1)
     data_inicio = st.sidebar.date_input("Data Início", date.today()-timedelta(days=DEFAULTS["dias_filtro_inicio"]))
@@ -472,7 +482,8 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
     return dict(
         min_sim=min_sim, min_containment=min_containment, pre_delta=pre_delta,
         diff_limit=diff_limit, dias_hist=dias_hist, data_inicio=data_inicio, data_fim=data_fim,
-        pastas=pastas_sel, status=status_sel, use_cnj=use_cnj, use_datajuri=use_datajuri
+        pastas=pastas_sel, status=status_sel, use_cnj=use_cnj, use_datajuri=use_datajuri,
+        view_min=view_min, show_low=show_low
     )
 
 # =============================================================================
@@ -484,7 +495,7 @@ def color_for_badge(score: float, min_sim_pct: float) -> str:
     if score >= (min_sim_pct): return "badge-yellow"
     return "badge-red"
 
-def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int):
+def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, view_min_pct: int, show_low: bool):
     group_id = group_rows[0]["activity_id"]
     state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
         "principal_id": group_rows[0]["activity_id"],
@@ -493,6 +504,37 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int):
     })
 
     with st.expander(f"Grupo com {len(group_rows)} itens — Pasta: {group_rows[0].get('activity_folder','')}", expanded=False):
+        # === Melhor principal (medoid por média de similaridade aos demais) ===
+        col_m1, col_m2 = st.columns([0.25, 0.75])
+        with col_m1:
+            if st.button("⭐ Definir melhor principal", key=f"auto_princ_{group_id}"):
+                best_id, best_avg = None, -1.0
+                cache_norm, cache_meta = {}, {}
+                def nrm(rid, txt):
+                    if rid in cache_norm: return cache_norm[rid], cache_meta[rid]
+                    meta = extract_meta(txt); nm = normalize_for_match(txt)
+                    cache_norm[rid], cache_meta[rid] = nm, meta
+                    return nm, meta
+                ids = [r["activity_id"] for r in group_rows]
+                for i in range(len(group_rows)):
+                    rid_i = group_rows[i]["activity_id"]
+                    ni, mi = nrm(rid_i, group_rows[i].get("Texto",""))
+                    scores = []
+                    for j in range(len(group_rows)):
+                        if i==j: continue
+                        rid_j = group_rows[j]["activity_id"]
+                        nj, mj = nrm(rid_j, group_rows[j].get("Texto",""))
+                        s, det = combined_score(ni, nj, mi, mj)
+                        if det["contain"] >= st.session_state.get("cfg_vmin_cont", 0) and s >= (min_sim_pct):
+                            scores.append(s)
+                    avg = sum(scores)/len(scores) if scores else 0.0
+                    if avg > best_avg:
+                        best_avg, best_id = avg, rid_i
+                if best_id:
+                    state["principal_id"] = best_id
+                    state["open_compare"] = None
+                    st.rerun()
+
         # Mapa de metas e norms para o principal
         principal = next(r for r in group_rows if r["activity_id"] == state["principal_id"])
         p_meta = extract_meta(principal.get("Texto","")); p_norm = normalize_for_match(principal.get("Texto",""))
@@ -500,7 +542,8 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int):
 
         for row in group_rows:
             rid = row["activity_id"]
-            is_principal = (rid == state["principal_id"])
+            is_principal = (rid == state["principal_id"])\
+
             is_open = (rid == state["open_compare"])
             is_cancel = (rid in state["cancelados"])
 
@@ -517,6 +560,10 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int):
                     r_norm = normalize_for_match(row.get("Texto",""))
                     r_meta = extract_meta(row.get("Texto",""))
                     s, det = combined_score(p_norm, r_norm, p_meta, r_meta)
+                    if (not show_low) and (s < float(view_min_pct)):
+                        st.markdown("<span class='small-muted'>⬇️ Oculto por estar abaixo da exibição mínima.</span>", unsafe_allow_html=True)
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        continue
                     badge = color_for_badge(s, min_sim_abs)
                     st.markdown(f"<span class='similarity-badge {badge}'>Similaridade: {int(round(s))}%</span>", unsafe_allow_html=True)
                     st.caption(f"set={int(det['set'])} | sort={int(det['sort'])} | contain={int(det['contain'])} | len_pen={det['len_pen']:.2f} | bonus={det['bonus']}")
@@ -586,8 +633,6 @@ def process_actions(groups: List[List[Dict]], user: str):
     dry_run = st.session_state[SK.CFG].get("dry_run", False)
     total = 0; ok = 0; errs = 0
     for g in groups:
-        gid = None
-        # encontra estado do grupo pela primeira activity_id
         gid = g[0]["activity_id"]
         state = st.session_state[SK.GROUP_STATES].get(gid, {})
         canc = state.get("cancelados", set())
@@ -648,7 +693,7 @@ def render_calibration(df: pd.DataFrame, use_cnj: bool, use_datajuri: bool, dj_c
         return
     df_scores = pd.DataFrame(scores)
 
-    st.write("Estatísticas:", df_scores.describe()[["score","contain"]])
+    st.write("Estatísticas:", df_scores.describe([["score","contain"]]))
 
     if alt is not None:
         chart = alt.Chart(df_scores).mark_bar().encode(
@@ -718,7 +763,7 @@ def main():
         st.caption(f"Exibindo grupos {start+1}–{min(end, len(visible_groups))} de {len(visible_groups)}")
 
         for g in visible_groups[start:end]:
-            render_group(g, cfg["min_sim"]*100.0, cfg["diff_limit"])
+            render_group(g, cfg["min_sim"]*100.0, cfg["diff_limit"], cfg["view_min"], cfg["show_low"])
 
         col_a, col_b = st.columns([0.5,0.5])
         with col_a:
