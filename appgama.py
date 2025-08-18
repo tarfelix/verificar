@@ -451,9 +451,14 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
     # Guarda containment na sessão para heurística do "melhor principal"
     st.session_state["cfg_vmin_cont"] = min_containment
 
-    # NOVO: Exibição mínima vs principal
+    # NOVOS CONTROLES DE EXIBIÇÃO
     view_min = st.sidebar.slider("Exibição mínima (%)", 0, 100, int(sim_cfg.get("min_sim_global", DEFAULTS["min_sim_global"])), 1)
     show_low = st.sidebar.toggle("Mostrar itens abaixo da exibição mínima", value=False, help="Quando desligado, itens com similaridade ao principal abaixo do limiar serão ocultados na lista.")
+    strict_only = st.sidebar.toggle(
+        "Somente duplicados do principal (modo estrito)",
+        value=True,
+        help="Exibe apenas itens com similaridade ≥ Similaridade mínima e containment ≥ limiar em relação ao principal escolhido."
+    )
 
     st.sidebar.subheader("Escopo da comparação")
     dias_hist = st.sidebar.number_input("Dias de histórico", min_value=7, value=90, step=1)
@@ -483,7 +488,7 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
         min_sim=min_sim, min_containment=min_containment, pre_delta=pre_delta,
         diff_limit=diff_limit, dias_hist=dias_hist, data_inicio=data_inicio, data_fim=data_fim,
         pastas=pastas_sel, status=status_sel, use_cnj=use_cnj, use_datajuri=use_datajuri,
-        view_min=view_min, show_low=show_low
+        view_min=view_min, show_low=show_low, strict_only=strict_only
     )
 
 # =============================================================================
@@ -495,7 +500,7 @@ def color_for_badge(score: float, min_sim_pct: float) -> str:
     if score >= (min_sim_pct): return "badge-yellow"
     return "badge-red"
 
-def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, view_min_pct: int, show_low: bool):
+def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, view_min_pct: int, show_low: bool, strict_only: bool, min_containment_pct: float):
     group_id = group_rows[0]["activity_id"]
     state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
         "principal_id": group_rows[0]["activity_id"],
@@ -503,7 +508,26 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, vi
         "cancelados": set()
     })
 
-    with st.expander(f"Grupo com {len(group_rows)} itens — Pasta: {group_rows[0].get('activity_folder','')}", expanded=False):
+    # Escolhe principal e prepara normalizações/metas
+    principal = next(r for r in group_rows if r["activity_id"] == state["principal_id"]) if any(r["activity_id"]==state["principal_id"] for r in group_rows) else group_rows[0]
+    state["principal_id"] = principal["activity_id"]
+    p_meta = extract_meta(principal.get("Texto","")); p_norm = normalize_for_match(principal.get("Texto",""))
+
+    # Conta quantos serão exibidos (para o título) em modo estrito
+    display_count = len(group_rows)
+    if strict_only:
+        count = 1
+        for row in group_rows:
+            if row["activity_id"] == state["principal_id"]: continue
+            r_norm = normalize_for_match(row.get("Texto",""))
+            r_meta = extract_meta(row.get("Texto",""))
+            s, det = combined_score(p_norm, r_norm, p_meta, r_meta)
+            if s >= min_sim_pct and det["contain"] >= min_containment_pct:
+                count += 1
+        display_count = count
+
+    title_extra = f" — exibindo {display_count} de {len(group_rows)}" if strict_only else ""
+    with st.expander(f"Grupo com {len(group_rows)} itens{title_extra} — Pasta: {group_rows[0].get('activity_folder','')}", expanded=False):
         # === Melhor principal (medoid por média de similaridade aos demais) ===
         col_m1, col_m2 = st.columns([0.25, 0.75])
         with col_m1:
@@ -515,7 +539,6 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, vi
                     meta = extract_meta(txt); nm = normalize_for_match(txt)
                     cache_norm[rid], cache_meta[rid] = nm, meta
                     return nm, meta
-                ids = [r["activity_id"] for r in group_rows]
                 for i in range(len(group_rows)):
                     rid_i = group_rows[i]["activity_id"]
                     ni, mi = nrm(rid_i, group_rows[i].get("Texto",""))
@@ -535,17 +558,26 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, vi
                     state["open_compare"] = None
                     st.rerun()
 
-        # Mapa de metas e norms para o principal
-        principal = next(r for r in group_rows if r["activity_id"] == state["principal_id"])
-        p_meta = extract_meta(principal.get("Texto","")); p_norm = normalize_for_match(principal.get("Texto",""))
         min_sim_abs = min_sim_pct
 
         for row in group_rows:
             rid = row["activity_id"]
-            is_principal = (rid == state["principal_id"])\
-
+            is_principal = (rid == state["principal_id"]) 
             is_open = (rid == state["open_compare"])
             is_cancel = (rid in state["cancelados"])
+
+            # Pré-cálculo de score/containment e filtro ANTES de abrir o card
+            s = None; det = None
+            if not is_principal:
+                r_norm = normalize_for_match(row.get("Texto",""))
+                r_meta = extract_meta(row.get("Texto",""))
+                s, det = combined_score(p_norm, r_norm, p_meta, r_meta)
+                if strict_only:
+                    if (s < min_sim_abs) or (det["contain"] < min_containment_pct):
+                        continue
+                else:
+                    if (not show_low) and (s < float(view_min_pct)):
+                        continue
 
             card_class = "card-principal" if is_principal else ("card-cancelado" if is_cancel else "")
             st.markdown(f"<div class='{card_class}'>", unsafe_allow_html=True)
@@ -555,18 +587,13 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, vi
                 dt = as_sp(row.get("activity_date"))
                 st.markdown(f"**ID:** `{rid}` {'⭐ **Principal**' if is_principal else ''} {'🗑️ **Selecionado p/ cancelar**' if is_cancel else ''}")
                 st.caption(f"**Data:** {dt.strftime('%d/%m/%Y %H:%M') if dt else 'N/A'} | **Status:** {row.get('activity_status','')} | **Usuário:** {row.get('user_profile_name','')}")
-                # Badge de similaridade (somente se não for principal)
-                if not is_principal:
-                    r_norm = normalize_for_match(row.get("Texto",""))
-                    r_meta = extract_meta(row.get("Texto",""))
-                    s, det = combined_score(p_norm, r_norm, p_meta, r_meta)
-                    if (not show_low) and (s < float(view_min_pct)):
-                        st.markdown("<span class='small-muted'>⬇️ Oculto por estar abaixo da exibição mínima.</span>", unsafe_allow_html=True)
-                        st.markdown("</div>", unsafe_allow_html=True)
-                        continue
+
+                # Badge de similaridade (para não principal)
+                if not is_principal and s is not None:
                     badge = color_for_badge(s, min_sim_abs)
                     st.markdown(f"<span class='similarity-badge {badge}'>Similaridade: {int(round(s))}%</span>", unsafe_allow_html=True)
                     st.caption(f"set={int(det['set'])} | sort={int(det['sort'])} | contain={int(det['contain'])} | len_pen={det['len_pen']:.2f} | bonus={det['bonus']}")
+
                 # Chips de metacampos
                 r_meta_show = extract_meta(row.get("Texto",""))
                 chips = []
@@ -585,7 +612,7 @@ def render_group(group_rows: List[Dict], min_sim_pct: float, diff_limit: int, vi
                 if not is_principal and st.button("⚖️ Comparar com Principal", key=f"cmp_{rid}"):
                     state["open_compare"] = rid; st.rerun()
 
-                # ⚠️ Checkbox aparece somente após abrir a comparação deste item
+                # Checkbox só após abrir a comparação
                 if not is_principal and is_open:
                     ck = st.checkbox("🗑️ Marcar para Cancelar", value=is_cancel, key=f"cancel_{rid}")
                     if ck: state["cancelados"].add(rid)
@@ -763,7 +790,7 @@ def main():
         st.caption(f"Exibindo grupos {start+1}–{min(end, len(visible_groups))} de {len(visible_groups)}")
 
         for g in visible_groups[start:end]:
-            render_group(g, cfg["min_sim"]*100.0, cfg["diff_limit"], cfg["view_min"], cfg["show_low"])
+            render_group(g, cfg["min_sim"]*100.0, cfg["diff_limit"], cfg["view_min"], cfg["show_low"], cfg["strict_only"], cfg["min_containment"])
 
         col_a, col_b = st.columns([0.5,0.5])
         with col_a:
