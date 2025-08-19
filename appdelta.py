@@ -184,10 +184,13 @@ def init_firebase():
     try:
         # Verifica se o app já foi inicializado
         if not firebase_admin._apps:
-            creds_dict = st.secrets.get("firebase_credentials")
-            if not creds_dict:
+            creds_config = st.secrets.get("firebase_credentials")
+            if not creds_config:
                 st.warning("Credenciais do Firebase não encontradas em st.secrets. A auditoria está desativada.")
                 return None
+            
+            # Cria uma cópia mutável do dicionário de credenciais
+            creds_dict = dict(creds_config)
             
             # Corrige a chave privada que vem com `\n` literais do secrets
             creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
