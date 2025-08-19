@@ -861,4 +861,68 @@ def main():
                     st.rerun()
                 else:
                     st.sidebar.error("Por favor, insira um nome de usuário.")
-        st.info("👋 Bem-vindo! Por favor, f
+        st.info("👋 Bem-vindo! Por favor, faça o login na barra lateral para começar.")
+        st.stop()
+
+    engine = db_engine_mysql()
+    df_full = carregar_dados_mysql(engine, 365) # Carrega um ano para os filtros
+    
+    params = sidebar_controls(df_full)
+    
+    # Carrega os dados para o período de análise selecionado
+    df_analysis = carregar_dados_mysql(engine, params["dias_hist"])
+    if df_analysis.empty:
+        st.warning("Nenhuma atividade encontrada para o período de análise selecionado.")
+        st.stop()
+
+    # Aplica filtros de visualização (data, pasta, status)
+    mask = (
+        (df_analysis["activity_date"].dt.date >= params["data_inicio"]) &
+        (df_analysis["activity_date"].dt.date <= params["data_fim"])
+    )
+    if params["pastas"]: mask &= df_analysis["activity_folder"].isin(params["pastas"])
+    if params["status"]: mask &= df_analysis["activity_status"].isin(params["status"])
+    df_view = df_analysis[mask].copy()
+
+    # Abas principais da aplicação
+    tab1, tab2 = st.tabs(["🔎 Análise de Duplicidades", "📊 Calibração"])
+
+    with tab1:
+        groups = criar_grupos_de_duplicatas(df_view, params)
+        
+        st.metric("Grupos de Duplicatas Encontrados", len(groups))
+
+        # Paginação dos grupos
+        page_size = st.number_input("Grupos por página", min_value=5, value=DEFAULTS["itens_por_pagina"], step=5)
+        total_pages = max(1, math.ceil(len(groups) / page_size))
+        page_num = st.number_input("Página", min_value=1, max_value=total_pages, value=1, step=1)
+        
+        start_idx = (page_num - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        st.caption(f"Exibindo grupos {start_idx + 1}–{min(end_idx, len(groups))} de {len(groups)}")
+
+        for group in groups[start_idx:end_idx]:
+            render_group(group, params)
+
+        st.markdown("---")
+        st.header("⚡ Ações em Massa")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            csv_data = export_groups_csv(groups)
+            st.download_button(
+                "⬇️ Exportar Grupos para CSV",
+                data=csv_data,
+                file_name="relatorio_duplicatas.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        with col_b:
+            if st.button("🚀 Processar Cancelamentos Marcados", type="primary", use_container_width=True):
+                process_cancellations(groups, st.session_state.get(SK.USERNAME, "usuário_desconhecido"))
+
+    with tab2:
+        render_calibration_tab(df_full)
+
+if __name__ == "__main__":
+    main()
