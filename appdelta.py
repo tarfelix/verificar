@@ -453,7 +453,7 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, params: Dict) -> List[List[Dict
             if len(component) > 1:
                 # Ordena os membros do grupo por data, do mais recente para o mais antigo
                 sorted_idxs = sorted(list(component), key=lambda ix: bucket_df.loc[ix, "activity_date"], reverse=True)
-                group_data = [work_df.iloc[bucket_df.loc[ix, "orig_idx"]].to_dict() for ix in sorted_idxs]
+                group_data = [work_df.loc[bucket_df.loc[ix, "orig_idx"]].to_dict() for ix in sorted_idxs]
                 groups.append(group_data)
 
         total_processed += len(idxs)
