@@ -14,7 +14,7 @@ Funcionalidades Principais:
 - Interface rica com modo de exibição estrito, seleção do "melhor principal", e comparação visual (diff).
 - Integração com API de cancelamento, incluindo resiliência (tentativas, rate-limit) e modo de teste (dry-run).
 - Painel de calibração para ajustar os limiares de similaridade por pasta.
-- Log de auditoria de todas as ações no Google Firestore.
+- Log de auditoria de todas as ações no Google Firestore com visualização na interface.
 """
 from __future__ import annotations
 
@@ -723,6 +723,19 @@ def render_group(group_rows: List[Dict], params: Dict, db_firestore):
             if comparado_row:
                 st.markdown("---")
                 st.subheader("Comparação Detalhada (Diff)")
+                
+                # Legenda para o Diff
+                st.markdown(
+                    """
+                    <div style='margin-bottom: 10px;'>
+                        <strong>Legenda:</strong>
+                        <span style='background-color: #c8e6c9; padding: 2px 5px; border-radius: 3px;'>Texto adicionado</span>
+                        <span style='background-color: #ffcdd2; padding: 2px 5px; border-radius: 3px; margin-left: 10px;'>Texto removido</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
                 c1, c2 = st.columns(2)
                 c1.markdown(f"**Principal: ID `{principal['activity_id']}`**")
                 c2.markdown(f"**Comparado: ID `{comparado_row['activity_id']}`**")
@@ -895,6 +908,50 @@ def render_calibration_tab(df: pd.DataFrame):
             st.warning("Biblioteca 'altair' não instalada. Exibindo gráfico simples.")
             st.line_chart(df_scores["score"])
 
+@st.cache_data(ttl=600)
+def get_firestore_history(_db, limit=100):
+    """Busca os últimos registros de auditoria do Firestore."""
+    if _db is None:
+        return []
+    try:
+        docs = _db.collection("duplicidade_actions").order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception as e:
+        st.error(f"Erro ao buscar histórico do Firestore: {e}")
+        return []
+
+def render_history_tab(db_firestore):
+    """Renderiza a aba de histórico de ações."""
+    st.subheader("📜 Histórico de Ações (Auditoria)")
+    
+    if db_firestore is None:
+        st.warning("A conexão com o Firebase (auditoria) não está ativa.")
+        return
+
+    if st.button("Atualizar Histórico"):
+        get_firestore_history.clear()
+
+    history = get_firestore_history(db_firestore)
+
+    if not history:
+        st.info("Nenhum registro de auditoria encontrado.")
+        return
+
+    for log in history:
+        ts = log.get("ts")
+        if isinstance(ts, datetime):
+            ts_local = ts.astimezone(TZ_SP)
+            timestamp_str = ts_local.strftime('%d/%m/%Y %H:%M:%S')
+        else:
+            timestamp_str = "Data indisponível"
+        
+        user = log.get("user", "N/A")
+        action = log.get("action", "N/A").replace("_", " ").title()
+        
+        with st.expander(f"**{action}** por **{user}** em {timestamp_str}"):
+            st.json(log.get("details", {}))
+
+
 # =============================================================================
 # FLUXO PRINCIPAL DO APLICATIVO
 # =============================================================================
@@ -946,7 +1003,7 @@ def main():
     df_view = df_analysis[mask].copy()
 
     # Abas principais da aplicação
-    tab1, tab2 = st.tabs(["🔎 Análise de Duplicidades", "📊 Calibração"])
+    tab1, tab2, tab3 = st.tabs(["🔎 Análise de Duplicidades", "📊 Calibração", "📜 Histórico de Ações"])
 
     with tab1:
         groups = criar_grupos_de_duplicatas(df_view, params)
@@ -984,6 +1041,10 @@ def main():
 
     with tab2:
         render_calibration_tab(df_full)
+
+    with tab3:
+        render_history_tab(db_firestore)
+
 
 if __name__ == "__main__":
     main()
