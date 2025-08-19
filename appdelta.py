@@ -9,11 +9,12 @@ combinando a lógica do app original com as melhorias propostas.
 Funcionalidades Principais:
 - Carregamento de dados de atividades do MySQL.
 - Algoritmo de similaridade avançado com RapidFuzz, penalidade de tamanho e bônus por campos.
-- Pré-índice (bucketing) por pasta, CNJ e, opcionalmente, pela pasta real do DataJuri.
+- Pré-índice (bucketing) por pasta e, opcionalmente, por CNJ.
 - Agrupamento transitivo (BFS) para formar grupos de duplicatas.
 - Interface rica com modo de exibição estrito, seleção do "melhor principal", e comparação visual (diff).
 - Integração com API de cancelamento, incluindo resiliência (tentativas, rate-limit) e modo de teste (dry-run).
 - Painel de calibração para ajustar os limiares de similaridade por pasta.
+- Log de auditoria de todas as ações no Google Firestore.
 """
 from __future__ import annotations
 
@@ -37,25 +38,28 @@ from unidecode import unidecode
 from rapidfuzz import fuzz, process
 from difflib import SequenceMatcher
 
-# Importa os clientes de API. Certifique-se de que os arquivos
-# api_functions_retry.py e datajuri_client.py estão na mesma pasta.
+# Importa o cliente de API. Certifique-se de que o arquivo
+# api_functions_retry.py está na mesma pasta.
 try:
     from api_functions_retry import HttpClientRetry
 except ImportError:
     st.error("Erro: O arquivo 'api_functions_retry.py' não foi encontrado. Ele é necessário para a comunicação com a API de cancelamento.")
     HttpClientRetry = None
 
-try:
-    from datajuri_client import DataJuriClient
-except ImportError:
-    st.warning("Aviso: O arquivo 'datajuri_client.py' não foi encontrado. A funcionalidade de busca por pasta no DataJuri será desativada.")
-    DataJuriClient = None
-
 # Opcional para o gráfico de calibração
 try:
     import altair as alt
 except ImportError:
     alt = None
+
+# Importações do Firebase para auditoria
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except ImportError:
+    st.warning("Aviso: A biblioteca 'firebase-admin' não foi encontrada. O log de auditoria será desativado.")
+    firebase_admin = None
+
 
 # =============================================================================
 # CONFIGURAÇÃO GERAL E CONSTANTES
@@ -65,7 +69,7 @@ TZ_SP = ZoneInfo("America/Sao_Paulo")
 TZ_UTC = ZoneInfo("UTC")
 
 # Chaves para o session_state do Streamlit, para evitar colisões
-SUFFIX = "_v2_refatorado"
+SUFFIX = "_v3_firebase"
 class SK:
     USERNAME = f"username_{SUFFIX}"
     SIMILARITY_CACHE = f"simcache_{SUFFIX}"
@@ -122,7 +126,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =============================================================================
-# INICIALIZAÇÃO DE SERVIÇOS (BANCO, APIS)
+# INICIALIZAÇÃO DE SERVIÇOS (BANCO, APIS, FIREBASE)
 # =============================================================================
 
 @st.cache_resource
@@ -172,32 +176,50 @@ def api_client() -> Optional[HttpClientRetry]:
     )
 
 @st.cache_resource
-def datajuri_client_instance() -> Optional[DataJuriClient]:
-    """Cria e armazena em cache o cliente para a API do DataJuri."""
-    if DataJuriClient is None: return None
+def init_firebase():
+    """Inicializa a conexão com o Firebase e retorna o cliente do Firestore."""
+    if not firebase_admin:
+        return None
     
-    dj_cfg = st.secrets.get("datajuri", {})
-    # O cliente aceita vários nomes de chave, então apenas passamos o dict
-    if not dj_cfg or not all(k in dj_cfg for k in ["DATAJURI_BASE_URL", "DATAJURI_CLIENT_ID", "DATAJURI_SECRET_ID", "DATAJURI_USERNAME", "DATAJURI_PASSWORD"]):
-        st.info("Credenciais do DataJuri não encontradas em st.secrets['datajuri']. A funcionalidade será desativada.")
-        return None
-        
     try:
-        # Renomeia as chaves para corresponder aos argumentos do construtor
-        client_args = {
-            "base_url": dj_cfg["DATAJURI_BASE_URL"],
-            "client_id": dj_cfg["DATAJURI_CLIENT_ID"],
-            "secret_id": dj_cfg["DATAJURI_SECRET_ID"],
-            "username": dj_cfg["DATAJURI_USERNAME"],
-            "password": dj_cfg["DATAJURI_PASSWORD"]
-        }
-        client = DataJuriClient(**client_args)
-        client.ensure_token() # Testa a autenticação na inicialização
-        st.sidebar.success("Cliente DataJuri conectado. ✅")
-        return client
+        # Verifica se o app já foi inicializado
+        if not firebase_admin._apps:
+            creds_dict = st.secrets.get("firebase_credentials")
+            if not creds_dict:
+                st.warning("Credenciais do Firebase não encontradas em st.secrets. A auditoria está desativada.")
+                return None
+            
+            # Corrige a chave privada que vem com `\n` literais do secrets
+            creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
+            
+            cred = credentials.Certificate(creds_dict)
+            firebase_admin.initialize_app(cred)
+        
+        db = firestore.client()
+        st.sidebar.success("Auditoria (Firebase) conectada. ✅")
+        return db
     except Exception as e:
-        st.sidebar.warning(f"Falha ao conectar no DataJuri: {e}. A funcionalidade será desativada.")
+        st.sidebar.error(f"Falha ao conectar no Firebase: {e}. Auditoria desativada.")
         return None
+
+def log_action_to_firestore(db, user: str, action: str, details: Dict):
+    """Registra uma ação do usuário no Firestore."""
+    if db is None:
+        return # Não faz nada se o cliente do Firestore não estiver disponível
+    
+    try:
+        doc_ref = db.collection("duplicidade_actions").document()
+        log_entry = {
+            "ts": firestore.SERVER_TIMESTAMP,
+            "user": user,
+            "action": action,
+            "details": details
+        }
+        doc_ref.set(log_entry)
+    except Exception as e:
+        logging.error(f"Erro ao registrar ação no Firestore: {e}")
+        st.toast(f"⚠️ Erro ao salvar log de auditoria: {e}", icon="🔥")
+
 
 # =============================================================================
 # CARREGAMENTO E PRÉ-PROCESSAMENTO DE DADOS
@@ -346,7 +368,7 @@ def combined_score(a_norm: str, b_norm: str, meta_a: Dict[str,str], meta_b: Dict
 # LÓGICA DE AGRUPAMENTO (BUCKETING E BFS)
 # =============================================================================
 
-def build_buckets(df: pd.DataFrame, use_cnj: bool, use_datajuri: bool, dj_client: Optional[DataJuriClient]) -> Dict[str, List[int]]:
+def build_buckets(df: pd.DataFrame, use_cnj: bool) -> Dict[str, List[int]]:
     """Agrupa atividades em 'baldes' (buckets) para otimizar a comparação."""
     buckets = defaultdict(list)
     for i, row in df.iterrows():
@@ -356,13 +378,8 @@ def build_buckets(df: pd.DataFrame, use_cnj: bool, use_datajuri: bool, dj_client
         # A chave base é sempre a pasta da atividade
         key = f"folder::{folder}"
         
-        # Se DataJuri estiver ativo e um CNJ for encontrado, tenta resolver a pasta real
-        if use_datajuri and dj_client and cnj:
-            pasta_real = dj_client.get_pasta_by_cnj_cached(cnj)
-            if pasta_real:
-                key = f"pasta_dj::{pasta_real}" # Usa a pasta do DataJuri como chave
-        # Senão, se a restrição por CNJ estiver ativa, adiciona o CNJ à chave
-        elif use_cnj:
+        # Se a restrição por CNJ estiver ativa, adiciona o CNJ à chave
+        if use_cnj:
             key = f"{key}::cnj::{cnj or 'SEM_CNJ'}"
             
         buckets[key].append(i)
@@ -377,7 +394,7 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, params: Dict) -> List[List[Dict
     sig = (
         tuple(sorted(df["activity_id"])),
         params['min_sim'], params['min_containment'], params['pre_delta'],
-        params['use_cnj'], params['use_datajuri'], cutoffs_tuple
+        params['use_cnj'], cutoffs_tuple
     )
     
     cached = st.session_state.get(SK.SIMILARITY_CACHE)
@@ -391,7 +408,7 @@ def criar_grupos_de_duplicatas(df: pd.DataFrame, params: Dict) -> List[List[Dict
     work_df["_meta"] = work_df["Texto"].apply(extract_meta)
     work_df["_norm"] = work_df["Texto"].apply(lambda t: normalize_for_match(t, stopwords_extra))
 
-    buckets = build_buckets(work_df, params['use_cnj'], params['use_datajuri'], params['dj_client'])
+    buckets = build_buckets(work_df, params['use_cnj'])
     cutoffs_map = st.secrets.get("similarity", {}).get("cutoffs_por_pasta", {})
 
     groups = []
@@ -533,7 +550,6 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
 
     st.sidebar.header("🚀 Otimizações (Pré-índice)")
     use_cnj = st.sidebar.toggle("Restringir por Nº do Processo (CNJ)", value=True, help="Compara apenas atividades que compartilham o mesmo número de processo.")
-    use_datajuri = st.sidebar.toggle("Usar Pasta Real (DataJuri)", value=True, disabled=(datajuri_client_instance() is None), help="Usa a API do DataJuri para agrupar pela pasta real do processo, mais preciso que o CNJ.")
     
     st.sidebar.header("📡 API de Cancelamento")
     dry_run = st.sidebar.toggle("Modo Teste (Dry-run)", value=bool(st.secrets.get("api_client", {}).get("dry_run", False)), help="Se ativo, simula as chamadas de API sem cancelar as atividades de fato.")
@@ -546,8 +562,8 @@ def sidebar_controls(df_full: pd.DataFrame) -> Dict:
     return dict(
         min_sim=min_sim, min_containment=min_containment, pre_delta=pre_delta,
         diff_limit=diff_limit, dias_hist=dias_hist, data_inicio=data_inicio, data_fim=data_fim,
-        pastas=pastas_sel, status=status_sel, use_cnj=use_cnj, use_datajuri=use_datajuri,
-        strict_only=strict_only, dj_client=datajuri_client_instance()
+        pastas=pastas_sel, status=status_sel, use_cnj=use_cnj,
+        strict_only=strict_only
     )
 
 def get_best_principal_id(group_rows: List[Dict], min_sim_pct: float, min_containment_pct: float) -> str:
@@ -575,9 +591,10 @@ def get_best_principal_id(group_rows: List[Dict], min_sim_pct: float, min_contai
             
     return best_id or group_rows[0]['activity_id'] # Fallback para o primeiro item
 
-def render_group(group_rows: List[Dict], params: Dict):
+def render_group(group_rows: List[Dict], params: Dict, db_firestore):
     """Renderiza um único grupo de atividades duplicadas."""
     group_id = group_rows[0]["activity_id"]
+    user = st.session_state.get(SK.USERNAME, "desconhecido")
     
     # Inicializa ou recupera o estado deste grupo
     state = st.session_state[SK.GROUP_STATES].setdefault(group_id, {
@@ -616,6 +633,12 @@ def render_group(group_rows: List[Dict], params: Dict):
         with col2:
             if st.button("⭐ Definir Melhor Principal", key=f"auto_princ_{group_id}", use_container_width=True):
                 best_id = get_best_principal_id(group_rows, params['min_sim'] * 100, params['min_containment'])
+                log_action_to_firestore(db_firestore, user, "set_principal", {
+                    "group_id": group_id,
+                    "previous_principal_id": state["principal_id"],
+                    "new_principal_id": best_id,
+                    "method": "automatic"
+                })
                 state["principal_id"] = best_id
                 state["open_compare"] = None # Fecha comparações abertas
                 st.rerun()
@@ -659,6 +682,12 @@ def render_group(group_rows: List[Dict], params: Dict):
                     # Botões de ação
                     if not is_principal:
                         if st.button("⭐ Tornar Principal", key=f"mkp_{rid}", use_container_width=True):
+                            log_action_to_firestore(db_firestore, user, "set_principal", {
+                                "group_id": group_id,
+                                "previous_principal_id": state["principal_id"],
+                                "new_principal_id": rid,
+                                "method": "manual"
+                            })
                             state["principal_id"] = rid
                             state["open_compare"] = None
                             st.rerun()
@@ -672,6 +701,12 @@ def render_group(group_rows: List[Dict], params: Dict):
                         st.markdown("---")
                         cancel_checked = st.checkbox("🗑️ Marcar para Cancelar", value=is_marked_for_cancel, key=f"cancel_{rid}")
                         if cancel_checked != is_marked_for_cancel:
+                            action = "mark_cancel" if cancel_checked else "unmark_cancel"
+                            log_action_to_firestore(db_firestore, user, action, {
+                                "group_id": group_id,
+                                "principal_id": state["principal_id"],
+                                "target_activity_id": rid
+                            })
                             if cancel_checked:
                                 state["cancelados"].add(rid)
                             else:
@@ -715,7 +750,7 @@ def export_groups_csv(groups: List[List[Dict]]) -> bytes:
     if not rows: return b""
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
-def process_cancellations(groups: List[List[Dict]], user: str):
+def process_cancellations(groups: List[List[Dict]], user: str, db_firestore):
     """Processa todos os cancelamentos marcados na interface."""
     client = api_client()
     if not client:
@@ -729,11 +764,12 @@ def process_cancellations(groups: List[List[Dict]], user: str):
     for g in groups:
         gid = g[0]["activity_id"]
         state = st.session_state[SK.GROUP_STATES].get(gid, {})
-        principal_id = state.get("principal_id")  # Pega o ID principal do grupo
+        principal_id = state.get("principal_id")
         
         if principal_id:
             for cancel_id in state.get("cancelados", set()):
                 to_cancel_with_context.append({
+                    "group_id": gid,
                     "cancel_id": cancel_id,
                     "principal_id": principal_id
                 })
@@ -750,7 +786,6 @@ def process_cancellations(groups: List[List[Dict]], user: str):
         act_id = item["cancel_id"]
         principal_id = item["principal_id"]
         try:
-            # Passa o ID principal para o método do cliente
             response = client.activity_canceled(
                 activity_id=act_id,
                 user_name=user,
@@ -758,13 +793,18 @@ def process_cancellations(groups: List[List[Dict]], user: str):
             )
             if response and (response.get("ok") or response.get("success")):
                 results["ok"] += 1
+                log_action_to_firestore(db_firestore, user, "process_cancellation_success", item)
                 logging.info(f"Sucesso ao cancelar {act_id}.")
             else:
                 results["err"] += 1
+                item["api_response"] = response
+                log_action_to_firestore(db_firestore, user, "process_cancellation_failure", item)
                 st.warning(f"Falha ao cancelar {act_id}. Resposta: {response}")
                 logging.error(f"Falha ao cancelar {act_id}. Resposta: {response}")
         except Exception as e:
             results["err"] += 1
+            item["exception"] = str(e)
+            log_action_to_firestore(db_firestore, user, "process_cancellation_exception", item)
             st.error(f"Erro de exceção ao cancelar {act_id}: {e}")
             logging.exception(f"Erro de exceção ao cancelar {act_id}")
         
@@ -869,16 +909,20 @@ def main():
     if not st.session_state.get(SK.USERNAME):
         with st.sidebar.form("login_form"):
             username = st.text_input("Nome de Usuário")
+            password = st.text_input("Senha", type="password")
             if st.form_submit_button("Entrar"):
-                if username:
+                # Validação de credenciais a partir de st.secrets
+                if username and password and st.secrets.credentials.usernames.get(username) == password:
                     st.session_state[SK.USERNAME] = username
                     st.rerun()
                 else:
-                    st.sidebar.error("Por favor, insira um nome de usuário.")
+                    st.sidebar.error("Usuário ou senha inválidos.")
         st.info("👋 Bem-vindo! Por favor, faça o login na barra lateral para começar.")
         st.stop()
 
     engine = db_engine_mysql()
+    db_firestore = init_firebase()
+
     df_full = carregar_dados_mysql(engine, 365) # Carrega um ano para os filtros
     
     params = sidebar_controls(df_full)
@@ -917,7 +961,7 @@ def main():
         st.caption(f"Exibindo grupos {start_idx + 1}–{min(end_idx, len(groups))} de {len(groups)}")
 
         for group in groups[start_idx:end_idx]:
-            render_group(group, params)
+            render_group(group, params, db_firestore)
 
         st.markdown("---")
         st.header("⚡ Ações em Massa")
@@ -933,7 +977,7 @@ def main():
             )
         with col_b:
             if st.button("🚀 Processar Cancelamentos Marcados", type="primary", use_container_width=True):
-                process_cancellations(groups, st.session_state.get(SK.USERNAME, "usuário_desconhecido"))
+                process_cancellations(groups, st.session_state.get(SK.USERNAME), db_firestore)
 
     with tab2:
         render_calibration_tab(df_full)
