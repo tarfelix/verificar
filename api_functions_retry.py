@@ -110,27 +110,35 @@ class HttpClientRetry:
         logging.error(f"Todas as {self.max_attempts} tentativas falharam para a requisição {method} {url}.")
         return None
 
-    def activity_canceled(self, activity_id: str, user_name: str) -> Dict[str, Any]:
+    def activity_canceled(self, activity_id: str, user_name: str, principal_id: str) -> Dict[str, Any]:
         """
         Envia uma requisição para cancelar uma atividade por duplicidade.
 
         Args:
             activity_id (str): O ID da atividade a ser cancelada.
             user_name (str): O nome do usuário que está realizando a ação.
+            principal_id (str): O ID da atividade principal que motivou o cancelamento.
 
         Returns:
             dict: A resposta da API ou um dicionário de simulação em caso de dry_run.
         """
+        # Monta a mensagem de observação personalizada
+        observation_message = (
+            f"Cancelado pelo instrumento de verificar duplicado por {user_name}. "
+            f"Atividade duplicada da principal ID {principal_id}."
+        )
+
         if self.dry_run:
-            logging.info(f"[DRY-RUN] Simulado o cancelamento da atividade ID: {activity_id} pelo usuário: {user_name}")
+            logging.info(f"[DRY-RUN] Simulado o cancelamento da atividade ID: {activity_id} com a observação: '{observation_message}'")
             return {"ok": True, "success": True, "message": "Dry run mode"}
 
         endpoint = f"activity/{self.entity_id}/activitycanceledduplicate"
         body = {
             "entity_id": self.entity_id,
             "id": activity_id,
-            "activity_type_id": 152,  # Conforme especificado no guia
-            "user_name": user_name
+            "activity_type_id": 152,
+            "user_name": user_name,
+            "observation": observation_message  # Adiciona a observação ao corpo da requisição
         }
         
         response = self._make_request(method="PUT", endpoint=endpoint, json_data=body)
