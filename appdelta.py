@@ -725,23 +725,37 @@ def process_cancellations(groups: List[List[Dict]], user: str):
     # Atualiza o modo dry_run do cliente com base na seleção da UI
     client.dry_run = st.session_state[SK.CFG].get("dry_run", True)
     
-    to_cancel = []
+    to_cancel_with_context = []
     for g in groups:
         gid = g[0]["activity_id"]
         state = st.session_state[SK.GROUP_STATES].get(gid, {})
-        to_cancel.extend(list(state.get("cancelados", set())))
+        principal_id = state.get("principal_id")  # Pega o ID principal do grupo
+        
+        if principal_id:
+            for cancel_id in state.get("cancelados", set()):
+                to_cancel_with_context.append({
+                    "cancel_id": cancel_id,
+                    "principal_id": principal_id
+                })
 
-    if not to_cancel:
+    if not to_cancel_with_context:
         st.info("Nenhuma atividade foi marcada para cancelamento.")
         return
 
-    st.info(f"Iniciando o cancelamento de {len(to_cancel)} atividades...")
+    st.info(f"Iniciando o cancelamento de {len(to_cancel_with_context)} atividades...")
     progress = st.progress(0)
     results = {"ok": 0, "err": 0}
     
-    for i, act_id in enumerate(to_cancel):
+    for i, item in enumerate(to_cancel_with_context):
+        act_id = item["cancel_id"]
+        principal_id = item["principal_id"]
         try:
-            response = client.activity_canceled(activity_id=act_id, user_name=user)
+            # Passa o ID principal para o método do cliente
+            response = client.activity_canceled(
+                activity_id=act_id,
+                user_name=user,
+                principal_id=principal_id
+            )
             if response and (response.get("ok") or response.get("success")):
                 results["ok"] += 1
                 logging.info(f"Sucesso ao cancelar {act_id}.")
@@ -754,7 +768,7 @@ def process_cancellations(groups: List[List[Dict]], user: str):
             st.error(f"Erro de exceção ao cancelar {act_id}: {e}")
             logging.exception(f"Erro de exceção ao cancelar {act_id}")
         
-        progress.progress((i + 1) / len(to_cancel))
+        progress.progress((i + 1) / len(to_cancel_with_context))
 
     st.success(f"Processamento concluído! Sucessos: {results['ok']}, Falhas: {results['err']}.")
     if client.dry_run:
